@@ -1,0 +1,84 @@
+# Python "Baby‑Noise" Generator v1 – Technical Outline
+(broadcast‑quality white / pink / brown noise for YouTube & mobile apps)
+
+## 1. High‑level goals
+* Single engine that can
+   * render 10‑hour gap‑free WAV/FLAC files for YouTube with **GPU acceleration**, and
+   * stream in real‑time inside a phone app with <5% CPU on mid‑tier hardware.
+* Three noise colours (white, pink, brown) with a cross‑fade "warmth" slider.
+* Medical‑safe output – long‑term RMS ≲ 50 dB SPL, –1 dBFS peak ceiling. Real‑time LUFS monitor (60 s window) auto‑reduces gain if level > 50 dB SPL (AAP guideline).
+* Deterministic seeds for reproducible renders, but easy randomisation per export.
+* **Smart backend selection** that uses GPU for batch processing and CPU for real-time streaming.
+
+## 2. Key algorithms & evidence base
+
+| Component | Method | Source |
+|-----------|--------|--------|
+| White noise | **CuPy/NumPy Philox** counter‑based PRNG – 2²⁵⁶ period, jump‑ahead support | |
+| Pink noise | FIR (≈ 4097 taps) via FFT convolution, ±0.5 dB 20 Hz–20 kHz | |
+| Brown noise | Leaky integrator of white (a≈0.999) → 20 Hz HPF, **vectorized on GPU** | |
+| Offline long renders | **CuPy implementation** of colorednoise.powerlaw_psd_gaussian(β) (β = 0 / 1 / 2) | |
+| Baby sleep evidence | (white noise 80% asleep < 5 min) | |
+
+## 3. GPU Acceleration Strategy
+
+### Backend Selection Framework
+* **Runtime detection** of CUDA-compatible GPUs
+* Fallback to CPU processing when GPU unavailable or for mobile devices
+* Configurable threshold for GPU utilization (prefer CPU for small buffers)
+
+### GPU-optimized Noise Pipeline
+```
+graph TD
+  A[Philox white buffer<br><b>CuPy GPU PRNG</b>] --> B{Colour?}
+  B -->|white|  C[Gain stage<br><b>GPU vectorized</b>]
+  B -->|pink|   D[Pink noise<br><b>Large FIR via cupyx.scipy.signal.fftconvolve</b>]
+  B -->|brown|  E[Integrator<br><b>GPU vectorized</b>] --> F[One‑pole 20 Hz HPF<br><b>(2‑tap biquad kernel)</b>]
+  D --> C
+  F --> C
+  C --> G[Loudness meter<br><b>GPU reduction ops</b>]
+  G --> H[Brick‑wall limiter<br><b>GPU vectorized</b>]
+  H --> I[Memory transfer to host<br>Stream ↔ File sink]
+```
+
+### Implementation Details
+* **Buffer management**:
+   * Large-batch processing (128MB+ chunks) for GPU efficiency in offline rendering, auto‑shrinks if cudaMalloc fails (laptop 4 GB GPUs)
+   * 2048 samples for low-latency real-time on CPU
+* **Memory transfers**:
+   * Minimize CPU-GPU transfers by processing full audio blocks on GPU
+   * Asynchronous memory operations to hide transfer latency
+* **Level control**:
+   * GPU-accelerated RMS calculation using reduction operations
+   * Parallel limiter implementation for peak control
+* **Colour slider**:
+   * GPU-accelerated linear-blend: `mix = (1-α)*white + α*pink` (0 ≤ α ≤ 1)
+   * Extend to brown with two-segment blend
+
+## 4. Performance Optimizations
+
+### GPU-specific optimizations
+* **Batch processing** of multiple output segments in parallel
+* **Shared memory** usage for frequent operations (especially for biquad HPF)
+* **Stream synchronization** to manage dependencies
+* **Mixed precision** calculations where appropriate (fp16 everywhere except final gain + limiter, which stays fp32 to keep ≥ 96 dB SNR)
+* **Algorithm-specific optimizations**:
+   * **Pink noise**: Large FIR via FFT-based convolution (O(N log N) scaling)
+   * **HPF filtering**: One-pole 20 Hz HPF using 2-tap biquad kernel (avoids unnecessary FFTs)
+
+### Benchmarking targets
+* **10-hour render**: ≤30 minutes on RTX 4060 (10 h mono 44.1 kHz) vs 3+ hours on CPU
+* **Memory footprint**: <4GB GPU memory for full processing chain
+* **Mobile fallback**: Seamless transition to CPU for streaming use case
+
+### Platform Considerations
+* Desktop: Full GPU acceleration for rendering
+* Server: Multi-GPU support for batch rendering (future)
+* Mobile: CPU-only with optimized NumPy path
+
+## 5. Future DSP add-ons
+
+**Phase 2 (Q3 2025)** – *Optional soothing layers*
+* Heartbeat FLAC loop (low‑pass < 150 Hz) mixed at ‑24 dBFS
+* Slow ±2 dB LFO‑gain modulation (0.05 – 0.2 Hz) to reduce habituation
+* All add‑ons pass through the same LUFS limiter and safety tests
