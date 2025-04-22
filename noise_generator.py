@@ -107,12 +107,7 @@ class NoiseGenerator:
         )
         
         # For GPU-based processing, keep filter coefficients as NumPy arrays
-        # cupyx.scipy.signal.lfilter will automatically handle the transfer efficiently
         if config.use_gpu and HAS_CUPY:
-            # Keep coefficients as NumPy arrays - more efficient for cupyx
-            self.brown_hpf_b_gpu = self.brown_hpf_b  # Keep as NumPy array
-            self.brown_hpf_a_gpu = self.brown_hpf_a  # Keep as NumPy array
-            
             # Get cached pink FIR filter
             self.pink_fir = get_pink_fir(config.sample_rate)
         else:
@@ -163,17 +158,9 @@ class NoiseGenerator:
     def generate_brown_noise(self, white_noise: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
         """Transform white noise into brown noise using leaky integrator + HPF"""
         if self.config.use_gpu and HAS_CUPY:
-            # GPU implementation using cumsum for leaky integration (race-condition free)
-            # Scale input for leaky integration approximation
-            scaled_input = (1.0 - BROWN_LEAKY_ALPHA) * white_noise
-            
-            # Use cumsum for efficient parallel implementation of leaky integration
-            brown = cp.zeros_like(white_noise)
-            brown[0] = scaled_input[0]  # Initialize first sample
-            
-            # Compute cumulative sum with exponential decay
-            for i in range(1, len(white_noise)):
-                brown[i] = scaled_input[i] + BROWN_LEAKY_ALPHA * brown[i-1]
+            # GPU implementation using lfilter for leaky integration (vectorized)
+            # Leaky integrator: y[n] = (1-α)*x[n] + α*y[n-1] -> [1-α, 0] / [1, -α]
+            brown = cupyx.scipy.signal.lfilter([1.0 - BROWN_LEAKY_ALPHA], [1.0, -BROWN_LEAKY_ALPHA], white_noise)
             
             # Apply HPF to remove DC offset using cupyx.scipy.signal.lfilter
             return cupyx.scipy.signal.lfilter(self.brown_hpf_b, self.brown_hpf_a, brown)
@@ -441,8 +428,8 @@ class StreamingNoiseGenerator(NoiseGenerator):
         # Override buffer size for streaming
         self.buffer_samples = chunk_size
         
-        # Generate chunk
-        chunk, _ = self.generate_buffer()
+        # Generate chunk with explicit output format
+        chunk, _ = self.generate_buffer("PCM_16")
         
         return chunk
 

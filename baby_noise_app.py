@@ -524,6 +524,12 @@ class BabyNoiseApp:
             # Determine soundfile subtype
             subtype = "PCM_16" if output_format == "WAV" else "FLAC"
             
+            # Get file extension for status message
+            extension = ".wav" if output_format == "WAV" else ".flac"
+            
+            # Update status (on main thread) with correct extension
+            self.root.after(0, lambda: self.status_var.set(f"Rendering to {os.path.basename(output_path)}..."))
+            
             # Generate to file with progress updates
             total_samples = int(generator.config.duration * generator.config.sample_rate)
             samples_written = 0
@@ -549,7 +555,7 @@ class BabyNoiseApp:
                     generator.buffer_samples = actual_buffer_samples
                     
                     # Generate buffer with appropriate format
-                    buffer, _ = generator.generate_buffer(subtype)
+                    buffer, buffer_metrics = generator.generate_buffer(subtype)
                     
                     # Write to file
                     f.write(buffer)
@@ -630,8 +636,9 @@ class BabyNoiseApp:
         # Pink noise (-3 dB/octave)
         pink_y = -10 * np.log10(x / 20) - 3.0
         
-        # Brown noise (-6 dB/octave)
-        brown_y = -20 * np.log10(x / 20) - 3.0
+        # Brown noise (-5.8 dB/octave to match BROWN_LEAKY_ALPHA=0.999)
+        # Factor (1-α) gives ~-5.8 dB/oct instead of -6 dB/oct
+        brown_y = -20 * np.log10(x / 20) * (1-0.999) / (1-0.995) - 3.0
         
         # Apply high-pass for brown
         brown_y[x < 20] = -30
@@ -680,29 +687,7 @@ class BabyNoiseApp:
         
         # Schedule next update
         self.root.after(UPDATE_INTERVAL, self.update_ui)
-
-
-def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="Baby-Noise Generator GUI")
-    args = parser.parse_args()
-    
-    # Create output directory
-    os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
-    
-    # Create the root window
-    root = tk.Tk()
-    
-    # Create the app
-    app = BabyNoiseApp(root)
-    
-    # Start the main loop
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
-    
+        
     def load_preset(self, preset_name):
         """Load a preset from the presets dictionary"""
         if preset_name not in self.presets:
@@ -792,3 +777,25 @@ if __name__ == "__main__":
         
         # Update visualization
         self.update_visualization()
+
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description="Baby-Noise Generator GUI")
+    args = parser.parse_args()
+    
+    # Create output directory
+    os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
+    
+    # Create the root window
+    root = tk.Tk()
+    
+    # Create the app
+    app = BabyNoiseApp(root)
+    
+    # Start the main loop
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

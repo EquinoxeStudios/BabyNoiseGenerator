@@ -6,14 +6,15 @@ Tests for Baby-Noise Generator presets
 import os
 import pytest
 import yaml
+from pathlib import Path
 
-# Path to presets file, adjust if needed
-PRESETS_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "presets.yaml")
+# More robust path finding using pathlib
+PRESETS_FILE = Path(__file__).resolve().parent.parent / "presets.yaml"
 
 
 def test_presets_exist():
     """Test that presets file exists"""
-    assert os.path.exists(PRESETS_FILE), f"Presets file not found: {PRESETS_FILE}"
+    assert PRESETS_FILE.exists(), f"Presets file not found: {PRESETS_FILE}"
 
 
 def test_presets_yaml_valid():
