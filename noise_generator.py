@@ -112,12 +112,18 @@ class NoiseGenerator:
         
         # Pre-calculate filter coefficients for brown noise HPF
         nyquist = config.sample_rate / 2.0
-        self.brown_hpf_b, self.brown_hpf_a = scipy.signal.butter(
+        brown_hpf_b, brown_hpf_a = scipy.signal.butter(
             1, BROWN_HPF_FREQ / nyquist, btype='highpass'
         )
         
-        # For GPU-based processing, keep filter coefficients as NumPy arrays
+        # Store both NumPy and CuPy versions for appropriate use
+        self.brown_hpf_b = brown_hpf_b
+        self.brown_hpf_a = brown_hpf_a
+        
+        # If using GPU, also store CuPy versions
         if config.use_gpu and HAS_CUPY:
+            self.brown_hpf_b_gpu = cp.asarray(brown_hpf_b)
+            self.brown_hpf_a_gpu = cp.asarray(brown_hpf_a)
             # Get cached pink FIR filter
             self.pink_fir = get_pink_fir(config.sample_rate)
         else:
@@ -207,8 +213,8 @@ class NoiseGenerator:
             cumsum_result = cp.cumsum(reversed_input, dtype=cp.float32)
             brown = cumsum_result[::-1] * alpha_powers
             
-            # Apply HPF to remove DC offset using cupyx.scipy.signal.lfilter
-            return cupyx.scipy.signal.lfilter(self.brown_hpf_b, self.brown_hpf_a, brown)
+            # Apply HPF to remove DC offset using cupyx.scipy.signal.lfilter with GPU arrays
+            return cupyx.scipy.signal.lfilter(self.brown_hpf_b_gpu, self.brown_hpf_a_gpu, brown)
         else:
             # CPU implementation
             xp = np
@@ -271,59 +277,72 @@ class NoiseGenerator:
             else:
                 cpu_audio = audio
                 
-            # Calculate integrated LUFS
-            integrated_lufs = self.lufs_meter.integrated_loudness(cpu_audio)
+            # Ensure audio is mono and 1D for pyloudnorm
+            if len(cpu_audio.shape) > 1:
+                # If multidimensional, flatten to 1D
+                cpu_audio = cpu_audio.flatten()
             
-            # For momentary LUFS, use a sliding window
-            window_samples = int(window_size_sec * self.config.sample_rate)
-            hop_size = window_samples // 4  # 75% overlap
-            num_windows = max(1, (len(cpu_audio) - window_samples) // hop_size + 1)
-            
-            # Store momentary LUFS values
-            momentary_values = []
-            for i in range(num_windows):
-                start = i * hop_size
-                end = start + window_samples
-                if end > len(cpu_audio):
-                    break
+            try:
+                # Calculate integrated LUFS - pyloudnorm expects mono 1D array
+                integrated_lufs = self.lufs_meter.integrated_loudness(cpu_audio)
+                
+                # For momentary LUFS, use a sliding window
+                window_samples = int(window_size_sec * self.config.sample_rate)
+                hop_size = window_samples // 4  # 75% overlap
+                num_windows = max(1, (len(cpu_audio) - window_samples) // hop_size + 1)
+                
+                # Store momentary LUFS values
+                momentary_values = []
+                for i in range(num_windows):
+                    start = i * hop_size
+                    end = start + window_samples
+                    if end > len(cpu_audio):
+                        break
+                        
+                    window = cpu_audio[start:end]
+                    # Make sure window is 1D for pyloudnorm
+                    window = window.flatten()
+                    # Calculate momentary LUFS
+                    momentary = self.lufs_meter.integrated_loudness(window)
+                    momentary_values.append(momentary)
+                
+                # Return the LUFS values and integrated LUFS
+                if momentary_values:
+                    return xp.array(momentary_values), integrated_lufs
+                else:
+                    return xp.array([]), integrated_lufs
                     
-                window = cpu_audio[start:end]
-                # Calculate momentary (400ms) LUFS - pyloudnorm wants 2D array (channels, samples)
-                momentary = self.lufs_meter.integrated_loudness(window.reshape(1, -1))
-                momentary_values.append(momentary)
-            
-            # Return the LUFS values and integrated LUFS
-            if momentary_values:
-                return xp.array(momentary_values), integrated_lufs
-            else:
-                return xp.array([]), integrated_lufs
-            
+            except Exception as e:
+                # If pyloudnorm fails, log the error and fall back to simplified calculation
+                logger.warning(f"Error in pyloudnorm calculation: {str(e)}. Falling back to simplified LUFS.")
+                # Fall through to simplified calculation
+                pass
+                
+        # Fallback to simplified LUFS approximation if pyloudnorm not available or failed
+        window_samples = int(window_size_sec * self.config.sample_rate)
+        
+        # Use overlapping windows with 75% overlap
+        hop_size = window_samples // 4
+        num_windows = max(1, (len(audio) - window_samples) // hop_size + 1)
+        
+        loudness_values = []
+        for i in range(num_windows):
+            start = i * hop_size
+            end = start + window_samples
+            if end > len(audio):
+                break
+                
+            window = audio[start:end]
+            # Mean square (simplified LUFS)
+            ms = xp.mean(window**2)
+            loudness = -0.691 + 10 * xp.log10(ms + 1e-10)
+            loudness_values.append(loudness)
+        
+        # Return the loudness values and the integrated (gated) loudness
+        if loudness_values:
+            return xp.array(loudness_values), xp.mean(xp.array(loudness_values))
         else:
-            # Fallback to simplified LUFS approximation if pyloudnorm not available
-            window_samples = int(window_size_sec * self.config.sample_rate)
-            
-            # Use overlapping windows with 75% overlap
-            hop_size = window_samples // 4
-            num_windows = max(1, (len(audio) - window_samples) // hop_size + 1)
-            
-            loudness_values = []
-            for i in range(num_windows):
-                start = i * hop_size
-                end = start + window_samples
-                if end > len(audio):
-                    break
-                    
-                window = audio[start:end]
-                # Mean square (simplified LUFS)
-                ms = xp.mean(window**2)
-                loudness = -0.691 + 10 * xp.log10(ms + 1e-10)
-                loudness_values.append(loudness)
-            
-            # Return the loudness values and the integrated (gated) loudness
-            if loudness_values:
-                return xp.array(loudness_values), xp.mean(xp.array(loudness_values))
-            else:
-                return xp.array([]), -100.0
+            return xp.array([]), -100.0
     
     def apply_loudness_control(self, audio: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
         """Apply RMS target and peak ceiling with LUFS-based safety control"""
