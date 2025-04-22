@@ -66,7 +66,10 @@ def get_pink_fir(sample_rate, n_taps=4097):
         freq[0] = freq[1]  # Avoid division by zero
         response = 1.0 / cp.sqrt(freq)
         impulse = cp.fft.irfft(response)
-        window = cp.hanning(n_taps)
+        
+        # Fixed: Create window with the same size as impulse
+        window = cp.hanning(len(impulse))
+        
         impulse = impulse * window
         impulse = impulse / cp.sqrt(cp.sum(impulse**2))
         _pink_fir_cache[cache_key] = impulse
