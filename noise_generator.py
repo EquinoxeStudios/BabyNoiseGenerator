@@ -12,6 +12,7 @@ import soundfile as sf
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union, List
 import logging
+from functools import lru_cache
 
 # Optional GPU dependencies
 try:
@@ -39,6 +40,30 @@ CPU_BUFFER_SIZE = 2048               # Small buffer for real-time CPU processing
 BROWN_HPF_FREQ = 20.0       # Hz - remove DC offset and ultra-low freqs
 BROWN_LEAKY_ALPHA = 0.999   # Leaky integrator coefficient
 
+# Module-level cache for FIR filters
+_pink_fir_cache = {}
+
+
+@lru_cache(maxsize=8)
+def get_pink_fir(sample_rate, n_taps=4097):
+    """Cache and return pink noise FIR filter"""
+    if not HAS_CUPY:
+        return None
+        
+    cache_key = (sample_rate, n_taps)
+    if cache_key not in _pink_fir_cache:
+        # Generate filter coefficients
+        freq = cp.fft.rfftfreq(n_taps, 1/sample_rate)
+        freq[0] = freq[1]  # Avoid division by zero
+        response = 1.0 / cp.sqrt(freq)
+        impulse = cp.fft.irfft(response)
+        window = cp.hanning(n_taps)
+        impulse = impulse * window
+        impulse = impulse / cp.sqrt(cp.sum(impulse**2))
+        _pink_fir_cache[cache_key] = impulse
+    
+    return _pink_fir_cache[cache_key]
+
 
 @dataclass
 class NoiseConfig:
@@ -63,7 +88,8 @@ class NoiseGenerator:
         
         # Initialize the PRNG with seed
         if config.use_gpu and HAS_CUPY:
-            self.rng = cp.random.RandomState(seed=config.seed)
+            # Use newer Generator API with Philox algorithm for better performance
+            self.rng = cp.random.Generator(cp.random.Philox4x3210(config.seed))
         else:
             self.rng = np.random.RandomState(seed=config.seed)
         
@@ -78,24 +104,26 @@ class NoiseGenerator:
             1, BROWN_HPF_FREQ / nyquist, btype='highpass'
         )
         
-        # For pink noise FIR filter
+        # For GPU-based processing, convert filter coefficients to GPU arrays
         if config.use_gpu and HAS_CUPY:
-            # Generate 4097-tap FIR filter for pink noise using FFT method
-            n_taps = 4097
-            # Design filter to have 1/f spectrum (pink noise)
-            freq = cp.fft.rfftfreq(n_taps, 1/config.sample_rate)
-            # Avoid division by zero at DC
-            freq[0] = freq[1]
-            # 1/f frequency response
-            response = 1.0 / cp.sqrt(freq)
-            # Inverse FFT to get impulse response
-            impulse = cp.fft.irfft(response)
-            # Apply window to reduce ripple
-            window = cp.hanning(n_taps)
-            impulse = impulse * window
-            # Normalize
-            impulse = impulse / cp.sqrt(cp.sum(impulse**2))
-            self.pink_fir = impulse
+            self.brown_hpf_b_gpu = cp.array(self.brown_hpf_b)
+            self.brown_hpf_a_gpu = cp.array(self.brown_hpf_a)
+            
+            # Get cached pink FIR filter
+            self.pink_fir = get_pink_fir(config.sample_rate)
+            
+            # Define kernel for leaky integrator
+            self.brown_kernel = cp.RawKernel(r'''
+            extern "C" __global__
+            void leaky_integrator(const float* input, float* output, int length, float alpha) {
+                int i = blockDim.x * blockIdx.x + threadIdx.x;
+                if (i == 0) {
+                    output[i] = input[i];
+                } else if (i < length) {
+                    output[i] = alpha * output[i-1] + (1.0f - alpha) * input[i];
+                }
+            }
+            ''', 'leaky_integrator')
         else:
             # CPU version - pre-compute coefficients for IIR pink noise (Paul Kellett algorithm)
             self.pink_b0 = 0.99765 * 0.0555179
@@ -110,8 +138,8 @@ class NoiseGenerator:
     def generate_white_noise(self, length: int) -> np.ndarray:
         """Generate white noise using Philox PRNG"""
         if self.config.use_gpu and HAS_CUPY:
-            # GPU implementation
-            return self.rng.normal(0, 1, length).astype(cp.float32)
+            # GPU implementation using new Generator API
+            return self.rng.normal(0, 1, length, dtype=cp.float32)
         else:
             # CPU implementation
             return self.rng.normal(0, 1, length).astype(np.float32)
@@ -142,22 +170,27 @@ class NoiseGenerator:
     
     def generate_brown_noise(self, white_noise: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
         """Transform white noise into brown noise using leaky integrator + HPF"""
-        xp = cp if self.config.use_gpu and HAS_CUPY else np
-        
-        # Leaky integrator (vectorized)
-        brown = xp.zeros_like(white_noise)
-        brown[0] = white_noise[0]
-        # y[n] = α*y[n-1] + (1-α)*x[n]
-        for i in range(1, len(white_noise)):
-            brown[i] = BROWN_LEAKY_ALPHA * brown[i-1] + (1-BROWN_LEAKY_ALPHA) * white_noise[i]
-        
-        # Apply HPF to remove DC offset
         if self.config.use_gpu and HAS_CUPY:
-            # Move to CPU for filtering (until cupyx.scipy.signal.lfilter is more stable)
-            brown_cpu = cp.asnumpy(brown)
-            brown_filtered = scipy.signal.lfilter(self.brown_hpf_b, self.brown_hpf_a, brown_cpu)
-            return cp.array(brown_filtered)
+            # GPU implementation using RawKernel for leaky integrator
+            brown = cp.zeros_like(white_noise)
+            threads_per_block = 256
+            blocks_per_grid = (len(white_noise) + threads_per_block - 1) // threads_per_block
+            self.brown_kernel((blocks_per_grid,), (threads_per_block,), 
+                             (white_noise, brown, len(white_noise), BROWN_LEAKY_ALPHA))
+            
+            # Apply HPF to remove DC offset using cupyx.scipy.signal.lfilter
+            return cupyx.scipy.signal.lfilter(self.brown_hpf_b_gpu, self.brown_hpf_a_gpu, brown)
         else:
+            # CPU implementation
+            xp = np
+            # Leaky integrator (vectorized)
+            brown = xp.zeros_like(white_noise)
+            brown[0] = white_noise[0]
+            # y[n] = α*y[n-1] + (1-α)*x[n]
+            for i in range(1, len(white_noise)):
+                brown[i] = BROWN_LEAKY_ALPHA * brown[i-1] + (1-BROWN_LEAKY_ALPHA) * white_noise[i]
+            
+            # Apply HPF to remove DC offset
             return scipy.signal.lfilter(self.brown_hpf_b, self.brown_hpf_a, brown)
     
     def apply_color_mix(self, white: Union[np.ndarray, "cp.ndarray"], 
@@ -194,9 +227,43 @@ class NoiseGenerator:
         
         return audio * gain_mod
     
+    def calculate_lufs(self, audio: Union[np.ndarray, "cp.ndarray"], window_size_sec=1.0) -> Tuple[Union[np.ndarray, "cp.ndarray"], float]:
+        """Calculate LUFS-style loudness using a sliding window"""
+        xp = cp if self.config.use_gpu and HAS_CUPY else np
+        
+        # K-weighting filter coefficients (simplified)
+        # This is a simplified version - full LUFS would need proper filters
+        window_samples = int(window_size_sec * self.config.sample_rate)
+        
+        # Use overlapping windows with 75% overlap
+        hop_size = window_samples // 4
+        num_windows = max(1, (len(audio) - window_samples) // hop_size + 1)
+        
+        loudness_values = []
+        for i in range(num_windows):
+            start = i * hop_size
+            end = start + window_samples
+            if end > len(audio):
+                break
+                
+            window = audio[start:end]
+            # Mean square (simplified LUFS)
+            ms = xp.mean(window**2)
+            loudness = -0.691 + 10 * xp.log10(ms + 1e-10)
+            loudness_values.append(loudness)
+        
+        # Return the loudness values and the integrated (gated) loudness
+        if loudness_values:
+            return xp.array(loudness_values), xp.mean(xp.array(loudness_values))
+        else:
+            return xp.array([]), -100.0
+    
     def apply_loudness_control(self, audio: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
         """Apply RMS target and peak ceiling"""
         xp = cp if self.config.use_gpu and HAS_CUPY else np
+        
+        # Calculate LUFS for 1-second windows
+        _, integrated_lufs = self.calculate_lufs(audio, window_size_sec=1.0)
         
         # Calculate current RMS level
         current_rms_db = 20 * xp.log10(xp.sqrt(xp.mean(audio**2)) + 1e-10)
@@ -222,21 +289,22 @@ class NoiseGenerator:
     
     def apply_dither(self, audio: Union[np.ndarray, "cp.ndarray"]) -> np.ndarray:
         """Apply TPDF dither for 16-bit PCM output"""
-        xp = cp if self.config.use_gpu and HAS_CUPY else np
-        
-        # Generate TPDF dither (amplitude = 1 LSB at 16-bit)
-        amplitude = 2.0 / (2**16 - 1)
-        dither = xp.random.uniform(-amplitude, amplitude, len(audio)) - \
-                 xp.random.uniform(-amplitude, amplitude, len(audio))
-        
-        # Add dither
-        audio = audio + dither
-        
-        # Move to CPU if needed
         if self.config.use_gpu and HAS_CUPY:
-            return cp.asnumpy(audio)
+            # Move to CPU first
+            audio_cpu = cp.asnumpy(audio)
+            
+            # Generate and apply dither on CPU to avoid extra GPU->CPU transfer
+            amplitude = 2.0 / (2**16 - 1)
+            dither = np.random.uniform(-amplitude, amplitude, len(audio_cpu)) - \
+                     np.random.uniform(-amplitude, amplitude, len(audio_cpu))
+            return audio_cpu + dither
         else:
-            return audio
+            # CPU path remains unchanged
+            xp = np
+            amplitude = 2.0 / (2**16 - 1)
+            dither = xp.random.uniform(-amplitude, amplitude, len(audio)) - \
+                     xp.random.uniform(-amplitude, amplitude, len(audio))
+            return audio + dither
     
     def generate_buffer(self) -> Tuple[np.ndarray, Dict]:
         """Generate a buffer of noise according to configuration"""

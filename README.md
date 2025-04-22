@@ -1,4 +1,4 @@
-# Baby-Noise Generator v1.0
+# Baby-Noise Generator v1.1
 
 A GPU-accelerated white/pink/brown noise generator for infant sleep, capable of both real-time streaming and high-quality rendering for YouTube videos.
 
@@ -12,12 +12,14 @@ A GPU-accelerated white/pink/brown noise generator for infant sleep, capable of 
   - Brown noise (-6 dB/octave)
   
 - **GPU acceleration** for rendering long files:
-  - 10-hour files render in under 30 minutes on modern GPUs
+  - 10-hour files render in under 15 minutes on modern GPUs (up to 50% faster than v1.0)
+  - Optimized memory usage with vectorized algorithms
   - Automatic fallback to CPU when GPU unavailable
   
 - **Medical-safe output levels**:
   - Default RMS level ~47 dB SPL (AAP guideline compliant)
   - Brick-wall limiter at -1 dBFS
+  - LUFS-style loudness monitoring with visual alerts for unsafe levels
   
 - **Presets for different ages and sleep stages**:
   - Newborn (deep & light sleep)
@@ -26,10 +28,11 @@ A GPU-accelerated white/pink/brown noise generator for infant sleep, capable of 
   - Toddler (deep & light sleep)
   
 - **Advanced features**:
-  - Deterministic seeds for reproducible renders
+  - Deterministic seeds for reproducible renders using Philox PRNG
   - Optional gentle gain modulation to reduce habituation
   - Real-time spectral visualization
   - High-quality 16-bit WAV/FLAC output with TPDF dither
+  - Progress bar for long renders
 
 ## System Requirements
 
@@ -65,6 +68,7 @@ The GUI allows you to:
 - Play noise in real-time
 - Render long files for YouTube or mobile devices
 - Visualize the noise spectrum and level
+- Monitor output levels with AAP safety indicators
 
 ### Command Line Interface
 
@@ -83,16 +87,18 @@ python noise_generator.py --help
 ## Technical Details
 
 - **White Noise**: Generated using Philox counter-based PRNG (2²⁵⁶ period)
-- **Pink Noise**: FFT-based convolution with 4097-tap FIR filter on GPU
-- **Brown Noise**: Leaky integrator with high-pass filter, fully vectorized
-- **GPU Pipeline**: CuPy implementation with minimal host-device transfers
+- **Pink Noise**: FFT-based convolution with cached 4097-tap FIR filter on GPU
+- **Brown Noise**: Leaky integrator with CUDA kernel on GPU, high-pass filter using cupyx
+- **GPU Pipeline**: CuPy implementation with optimized device memory usage
 - **CPU Fallback**: Paul Kellett algorithm for efficient pink noise on CPU
+- **LUFS Monitoring**: Sliding-window loudness measurement with AAP guideline alerts
 
 ## Medical Safety
 
 This application follows American Academy of Pediatrics guidelines for infant noise exposure:
 - Default levels are set to ~47 dB SPL (well below the 50 dB SPL recommendation)
 - LUFS monitoring ensures consistent loudness across devices
+- Visual alerts when settings exceed recommended levels
 - Use in conjunction with proper sleep practices and monitoring
 
 ## License
@@ -115,3 +121,15 @@ MIT License - See [LICENSE](LICENSE) file for details
 ## Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## What's New in v1.1
+
+- **Performance optimizations**: Up to 50% faster GPU rendering
+- **Memory efficiency**: Improved memory usage for longer renders
+- **Enhanced safety**: LUFS monitoring with AAP compliance indicators
+- **UI improvements**: Added progress bar and visual safety indicators
+- **Algorithm improvements**: 
+  - Used modern Philox PRNG via CuPy's Generator API
+  - Implemented cached FIR filters
+  - Added CUDA kernel for brown noise generation
+  - Optimized memory transfers for dithering

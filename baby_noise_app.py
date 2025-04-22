@@ -38,6 +38,7 @@ APP_TITLE = "Baby-Noise Generator"
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Documents/BabyNoise")
 BUFFER_SIZE = 2048  # Audio buffer size for streaming
 UPDATE_INTERVAL = 50  # ms between UI updates
+SAFETY_RMS_THRESHOLD = -60.0  # dBFS (~50 dB SPL) - AAP safety threshold
 
 
 class BabyNoiseApp:
@@ -72,6 +73,7 @@ class BabyNoiseApp:
         self.duration_var = tk.IntVar(value=600)  # 10 minutes
         self.lfo_var = tk.DoubleVar(value=0.1)
         self.lfo_enabled_var = tk.BooleanVar(value=True)
+        self.progress_var = tk.DoubleVar(value=0.0)  # Progress for rendering
         
         # Current metrics
         self.current_rms = -100.0
@@ -92,12 +94,22 @@ class BabyNoiseApp:
     
     def create_ui(self):
         """Create the user interface"""
-        # Create main frame with padding
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
+        self._create_main_frame()
+        self._create_control_section()
+        self._create_playback_section()
+        self._create_render_section()
+        self._create_visualization()
+        self._create_status_bar()
+    
+    def _create_main_frame(self):
+        """Create the main application frame"""
+        self.main_frame = ttk.Frame(self.root, padding="10")
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+    
+    def _create_control_section(self):
+        """Create the noise control section"""
         # Create top section (controls)
-        control_frame = ttk.LabelFrame(main_frame, text="Noise Controls")
+        control_frame = ttk.LabelFrame(self.main_frame, text="Noise Controls")
         control_frame.pack(fill=tk.X, padx=5, pady=5)
         
         # Preset selection
@@ -159,7 +171,7 @@ class BabyNoiseApp:
         
         ttk.Label(volume_frame, text="Level (dB SPL):").pack(side=tk.LEFT, padx=5)
         rms_slider = ttk.Scale(volume_frame, from_=-70, to=-55, orient=tk.HORIZONTAL, 
-                              variable=self.rms_var)
+                              variable=self.rms_var, command=self.on_rms_change)
         rms_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         
         # Current RMS display
@@ -177,9 +189,10 @@ class BabyNoiseApp:
         lfo_slider = ttk.Scale(lfo_frame, from_=0.05, to=0.2, orient=tk.HORIZONTAL, 
                               variable=self.lfo_var)
         lfo_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        
-        # Playback controls
-        playback_frame = ttk.LabelFrame(main_frame, text="Playback")
+    
+    def _create_playback_section(self):
+        """Create the playback controls section"""
+        playback_frame = ttk.LabelFrame(self.main_frame, text="Playback")
         playback_frame.pack(fill=tk.X, padx=5, pady=5)
         
         # Play/Stop buttons
@@ -189,9 +202,10 @@ class BabyNoiseApp:
         self.play_button = ttk.Button(button_frame, text="▶ Play", 
                                      command=self.toggle_playback, width=15)
         self.play_button.pack(side=tk.LEFT, padx=5)
-        
-        # Render controls
-        render_frame = ttk.LabelFrame(main_frame, text="Render")
+    
+    def _create_render_section(self):
+        """Create the render controls section"""
+        render_frame = ttk.LabelFrame(self.main_frame, text="Render")
         render_frame.pack(fill=tk.X, padx=5, pady=5)
         
         # Duration and filename
@@ -203,16 +217,26 @@ class BabyNoiseApp:
                     values=[300, 600, 1800, 3600, 7200, 36000]).pack(side=tk.LEFT, padx=5)
         ttk.Label(duration_frame, text="seconds").pack(side=tk.LEFT)
         
-        # Render button
-        self.render_button = ttk.Button(render_frame, text="Render to File...", 
+        # Render button and progress bar
+        render_button_frame = ttk.Frame(render_frame)
+        render_button_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.render_button = ttk.Button(render_button_frame, text="Render to File...", 
                                        command=self.render_to_file)
         self.render_button.pack(side=tk.LEFT, padx=5, pady=5)
         
+        # Progress bar for rendering
+        self.progress_bar = ttk.Progressbar(render_frame, variable=self.progress_var, 
+                                           length=200, mode='determinate')
+        self.progress_bar.pack(fill=tk.X, padx=5, pady=5)
+    
+    def _create_visualization(self):
+        """Create the visualization section"""
         # Separator
-        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=5, pady=10)
+        ttk.Separator(self.main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=5, pady=10)
         
         # Visualization area
-        viz_frame = ttk.LabelFrame(main_frame, text="Visualization")
+        viz_frame = ttk.LabelFrame(self.main_frame, text="Visualization")
         viz_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         # Create matplotlib figure
@@ -222,10 +246,11 @@ class BabyNoiseApp:
         
         # Create subplots
         self.setup_plots()
-        
-        # Status bar
+    
+    def _create_status_bar(self):
+        """Create the status bar"""
         self.status_var = tk.StringVar(value="Ready")
-        self.status_bar = ttk.Label(main_frame, textvariable=self.status_var, 
+        self.status_bar = ttk.Label(self.main_frame, textvariable=self.status_var, 
                                    relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(fill=tk.X, padx=5, pady=2)
     
@@ -266,6 +291,11 @@ class BabyNoiseApp:
         
         # Target level line
         self.target_line, = self.level_ax.plot([], [], 'r--')
+        
+        # Safety threshold line
+        self.safety_line, = self.level_ax.plot([], [], 'r:', linewidth=1.5)
+        x_range = np.linspace(0, 10, 100)
+        self.safety_line.set_data(x_range, np.ones_like(x_range) * SAFETY_RMS_THRESHOLD)
         
         self.fig.tight_layout()
         self.canvas.draw()
@@ -420,6 +450,11 @@ class BabyNoiseApp:
         
         return config
     
+    def update_progress(self, progress_percentage):
+        """Update the progress bar during rendering"""
+        self.progress_var.set(progress_percentage)
+        self.root.update_idletasks()
+    
     def render_to_file(self):
         """Render noise to a file"""
         if self.streaming:
@@ -448,9 +483,10 @@ class BabyNoiseApp:
         # Create config
         config = self.create_config()
         
-        # Update status
+        # Update status and disable render button
         self.status_var.set(f"Rendering to {os.path.basename(output_path)}...")
         self.render_button.configure(state=tk.DISABLED)
+        self.progress_var.set(0)
         self.root.update()
         
         # Create generator
@@ -466,8 +502,33 @@ class BabyNoiseApp:
     def _render_thread(self, generator, output_path):
         """Background thread for rendering"""
         try:
-            # Generate to file
-            generator.generate_to_file(output_path)
+            # Generate to file with progress updates
+            total_samples = int(generator.config.duration * generator.config.sample_rate)
+            samples_written = 0
+            
+            # Create output file
+            with sf.SoundFile(output_path, mode='w', samplerate=generator.config.sample_rate, 
+                            channels=1, subtype='PCM_16') as f:
+                
+                # Generate and write buffers
+                for i in range(generator.num_buffers):
+                    remaining = total_samples - samples_written
+                    actual_buffer_samples = min(generator.buffer_samples, remaining)
+                    
+                    # Adjust buffer size for last buffer if needed
+                    if actual_buffer_samples < generator.buffer_samples:
+                        generator.buffer_samples = actual_buffer_samples
+                    
+                    # Generate buffer
+                    buffer, _ = generator.generate_buffer()
+                    
+                    # Write to file
+                    f.write(buffer)
+                    samples_written += len(buffer)
+                    
+                    # Update progress (on main thread)
+                    progress = samples_written / total_samples * 100
+                    self.root.after(0, lambda p=progress: self.update_progress(p))
             
             # Update UI from main thread
             self.root.after(0, lambda: self._render_complete(output_path))
@@ -500,6 +561,27 @@ class BabyNoiseApp:
         else:
             os.system(f'xdg-open "{path}"')
     
+    def on_rms_change(self, event=None):
+        """Handle RMS slider change"""
+        # Check if current RMS exceeds safety threshold
+        if self.rms_var.get() > SAFETY_RMS_THRESHOLD:
+            # Highlight the slider in red to indicate warning
+            self.rms_label.configure(foreground="red")
+            # Show warning if significantly over threshold
+            if self.rms_var.get() > SAFETY_RMS_THRESHOLD + 2.0:
+                messagebox.showwarning(
+                    "High Volume Warning", 
+                    f"The selected RMS level of {self.rms_var.get():.1f} dBFS exceeds the "
+                    f"AAP recommended level of {SAFETY_RMS_THRESHOLD:.1f} dBFS (50 dB SPL) "
+                    f"for infant hearing safety."
+                )
+        else:
+            # Reset to normal color
+            self.rms_label.configure(foreground="")
+        
+        # Update visualization
+        self.update_visualization()
+    
     def load_preset(self, preset_name):
         """Load a preset from the presets dictionary"""
         if preset_name not in self.presets:
@@ -520,6 +602,18 @@ class BabyNoiseApp:
         
         # Other parameters
         self.rms_var.set(preset.get('rms_target', -63.0))
+        
+        # Check if RMS exceeds safety threshold and warn
+        if self.rms_var.get() > SAFETY_RMS_THRESHOLD:
+            self.rms_label.configure(foreground="red")
+            messagebox.showwarning(
+                "High Volume Preset", 
+                f"The selected preset '{preset_name}' has an RMS level of {self.rms_var.get():.1f} dBFS, "
+                f"which exceeds the AAP recommended level of {SAFETY_RMS_THRESHOLD:.1f} dBFS (50 dB SPL) "
+                f"for infant hearing safety."
+            )
+        else:
+            self.rms_label.configure(foreground="")
         
         lfo_rate = preset.get('lfo_rate')
         if lfo_rate is not None:

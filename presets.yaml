@@ -1,5 +1,6 @@
 # Baby-Noise Generator Presets
 # Phase-based noise presets for different infant sleep stages
+# Note: American Academy of Pediatrics (AAP) recommends levels below -60 dBFS (~50 dB SPL)
 
 presets:
   newborn_deep:
@@ -39,7 +40,7 @@ presets:
     
   toddler_light:
     color_mix: {white: 0.7, pink: 0.2, brown: 0.1}
-    rms_target: -60.0  # ~50 dB SPL
+    rms_target: -60.0  # ~50 dB SPL (at AAP recommended limit)
     lfo_rate: 0.18     # Hz
     
   default:
