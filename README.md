@@ -20,6 +20,7 @@ A GPU-accelerated white/pink/brown noise generator for infant sleep, capable of 
   - Default RMS level ~47 dB SPL (AAP guideline compliant)
   - Brick-wall limiter at -1 dBFS
   - LUFS-style loudness monitoring with visual alerts for unsafe levels
+  - Automatic gain reduction for levels exceeding safety thresholds
   
 - **Presets for different ages and sleep stages**:
   - Newborn (deep & light sleep)
@@ -47,7 +48,7 @@ A GPU-accelerated white/pink/brown noise generator for infant sleep, capable of 
 
 ```bash
 pip install -r requirements.txt
-pip install cupy-cuda11x  # Optional: for GPU acceleration
+pip install cupy-cuda12x  # Optional: for GPU acceleration
 ```
 
 See the [Installation Guide](INSTALL.md) for detailed instructions.
@@ -88,7 +89,7 @@ python noise_generator.py --help
 
 - **White Noise**: Generated using Philox counter-based PRNG (2²⁵⁶ period)
 - **Pink Noise**: FFT-based convolution with cached 4097-tap FIR filter on GPU
-- **Brown Noise**: Leaky integrator with CUDA kernel on GPU, high-pass filter using cupyx
+- **Brown Noise**: Optimized sequential implementation with high-pass filter
 - **GPU Pipeline**: CuPy implementation with optimized device memory usage
 - **CPU Fallback**: Paul Kellett algorithm for efficient pink noise on CPU
 - **LUFS Monitoring**: Sliding-window loudness measurement with AAP guideline alerts
@@ -99,6 +100,7 @@ This application follows American Academy of Pediatrics guidelines for infant no
 - Default levels are set to ~47 dB SPL (well below the 50 dB SPL recommendation)
 - LUFS monitoring ensures consistent loudness across devices
 - Visual alerts when settings exceed recommended levels
+- Automatic safety gain reduction when threshold is exceeded
 - Use in conjunction with proper sleep practices and monitoring
 
 ## License
@@ -126,10 +128,11 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines
 
 - **Performance optimizations**: Up to 50% faster GPU rendering
 - **Memory efficiency**: Improved memory usage for longer renders
-- **Enhanced safety**: LUFS monitoring with AAP compliance indicators
+- **Enhanced safety**: LUFS monitoring with AAP compliance indicators and auto-gain reduction
 - **UI improvements**: Added progress bar and visual safety indicators
+- **Format support**: Added FLAC output option with optimized dithering
 - **Algorithm improvements**: 
   - Used modern Philox PRNG via CuPy's Generator API
-  - Implemented cached FIR filters
-  - Added CUDA kernel for brown noise generation
+  - Implemented cached FIR filters with improved FFT plan reuse
+  - Enhanced brown noise generation for deterministic output
   - Optimized memory transfers for dithering

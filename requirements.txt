@@ -1,105 +1,14 @@
-# Baby-Noise Generator - Requirements and Installation
-
-## System Requirements
-
-- Python 3.8 or newer
-- GPU with CUDA support (optional, for accelerated rendering)
-
-## Dependencies
-
-The Baby-Noise Generator requires the following Python packages:
-
-### Required Packages
-```
+# Baby-Noise Generator v1.1 - Requirements
+# Core dependencies
 numpy>=1.20.0
 scipy>=1.7.0
 soundfile>=0.10.0
-pyyaml>=5.1
 sounddevice>=0.4.5
 matplotlib>=3.5.0
-```
+pyyaml>=5.1.0
+pyloudnorm>=0.1.0
+pytest>=7.0.0
 
-### Optional Packages (for GPU acceleration)
-```
-cupy>=11.0.0
-cupyx-scipy>=11.0.0
-```
-
-## Installation Instructions
-
-1. Clone the repository or download the source code:
-   ```
-   git clone https://github.com/yourusername/baby-noise-generator.git
-   cd baby-noise-generator
-   ```
-
-2. Create a virtual environment (recommended):
-   ```
-   python -m venv venv
-   ```
-
-3. Activate the virtual environment:
-   - Windows: `venv\Scripts\activate`
-   - Linux/macOS: `source venv/bin/activate`
-
-4. Install required dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-
-5. Install GPU dependencies (optional, CUDA required):
-   ```
-   pip install cupy-cuda11x cupyx-scipy
-   ```
-   Note: Replace `cuda11x` with the appropriate CUDA version for your system.
-
-## Usage
-
-### GUI Application
-
-To start the graphical user interface:
-```
-python baby_noise_app.py
-```
-
-### Command Line Interface
-
-For command-line rendering:
-```
-python noise_generator.py --output output.wav --duration 600 --preset newborn_deep
-```
-
-Available options:
-```
---output, -o     Output file path
---duration, -d   Duration in seconds
---seed           PRNG seed (auto, random, or integer)
---preset, -p     Preset name
---presets-file   Custom presets YAML file
---white          White noise ratio (0.0-1.0)
---pink           Pink noise ratio (0.0-1.0)
---brown          Brown noise ratio (0.0-1.0)
---rms            RMS target in dBFS
---peak           Peak ceiling in dBFS
---lfo            LFO rate in Hz
---cpu            Force CPU backend
---gpu            Force GPU backend
-```
-
-## Project Structure
-
-- `noise_generator.py` - Core noise generation engine
-- `baby_noise_app.py` - GUI application
-- `presets.yaml` - Noise presets configuration
-
-## Output Files
-
-By default, rendered files are saved to:
-- Windows: `Documents\BabyNoise\`
-- macOS/Linux: `~/Documents/BabyNoise/`
-
-## Notes for Developers
-
-- The code automatically detects and uses GPU acceleration when available
-- For best performance on long renders, ensure you have at least 4GB of GPU memory
-- Mobile devices will automatically use the CPU backend
+# Optional GPU acceleration
+# cupy>=12.0.0
+# cupyx-scipy>=12.0.0

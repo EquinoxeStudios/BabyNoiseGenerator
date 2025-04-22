@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Baby-Noise Generator App
+# Baby-Noise Generator App v1.1
 # GUI application for the Baby-Noise Generator
 
 import os
@@ -19,11 +19,13 @@ from tkinter import ttk, filedialog, messagebox
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
+import soundfile as sf
 
 # Import our noise generator module
 from noise_generator import (
     NoiseConfig, StreamingNoiseGenerator, NoiseGenerator, 
-    load_preset, auto_select_backend, SAMPLE_RATE
+    load_preset, auto_select_backend, SAMPLE_RATE,
+    SAFETY_LUFS_THRESHOLD
 )
 
 # Configure logging
@@ -34,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("baby-noise-app")
 
 # Constants
-APP_TITLE = "Baby-Noise Generator"
+APP_TITLE = "Baby-Noise Generator v1.1"
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Documents/BabyNoise")
 BUFFER_SIZE = 2048  # Audio buffer size for streaming
 UPDATE_INTERVAL = 50  # ms between UI updates
@@ -74,6 +76,7 @@ class BabyNoiseApp:
         self.lfo_var = tk.DoubleVar(value=0.1)
         self.lfo_enabled_var = tk.BooleanVar(value=True)
         self.progress_var = tk.DoubleVar(value=0.0)  # Progress for rendering
+        self.output_format_var = tk.StringVar(value="WAV")
         
         # Current metrics
         self.current_rms = -100.0
@@ -216,6 +219,14 @@ class BabyNoiseApp:
         ttk.Combobox(duration_frame, textvariable=self.duration_var, 
                     values=[300, 600, 1800, 3600, 7200, 36000]).pack(side=tk.LEFT, padx=5)
         ttk.Label(duration_frame, text="seconds").pack(side=tk.LEFT)
+        
+        # Format selection
+        format_frame = ttk.Frame(render_frame)
+        format_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(format_frame, text="Format:").pack(side=tk.LEFT, padx=5)
+        ttk.Combobox(format_frame, textvariable=self.output_format_var, 
+                    values=["WAV", "FLAC"]).pack(side=tk.LEFT, padx=5)
         
         # Render button and progress bar
         render_button_frame = ttk.Frame(render_frame)
@@ -464,17 +475,25 @@ class BabyNoiseApp:
         # Create output directory if it doesn't exist
         os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
         
+        # Get output format
+        output_format = self.output_format_var.get().upper()
+        extension = ".wav" if output_format == "WAV" else ".flac"
+        
         # Default filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_filename = f"baby_noise_{timestamp}.wav"
+        default_filename = f"baby_noise_{timestamp}{extension}"
         default_path = os.path.join(DEFAULT_OUTPUT_DIR, default_filename)
         
         # Ask for output path
         output_path = filedialog.asksaveasfilename(
             initialdir=DEFAULT_OUTPUT_DIR,
             initialfile=default_filename,
-            defaultextension=".wav",
-            filetypes=[("WAV files", "*.wav"), ("FLAC files", "*.flac"), ("All files", "*.*")]
+            defaultextension=extension,
+            filetypes=[
+                ("WAV files", "*.wav"), 
+                ("FLAC files", "*.flac"), 
+                ("All files", "*.*")
+            ]
         )
         
         if not output_path:
@@ -495,32 +514,42 @@ class BabyNoiseApp:
         # Start rendering in a separate thread
         threading.Thread(
             target=self._render_thread,
-            args=(generator, output_path),
+            args=(generator, output_path, output_format),
             daemon=True
         ).start()
     
-    def _render_thread(self, generator, output_path):
+    def _render_thread(self, generator, output_path, output_format):
         """Background thread for rendering"""
         try:
+            # Determine soundfile subtype
+            subtype = "PCM_16" if output_format == "WAV" else "FLAC"
+            
             # Generate to file with progress updates
             total_samples = int(generator.config.duration * generator.config.sample_rate)
             samples_written = 0
             
             # Create output file
-            with sf.SoundFile(output_path, mode='w', samplerate=generator.config.sample_rate, 
-                            channels=1, subtype='PCM_16') as f:
+            with sf.SoundFile(
+                output_path, 
+                mode='w', 
+                samplerate=generator.config.sample_rate, 
+                channels=1, 
+                subtype=subtype
+            ) as f:
+                
+                # Store original buffer size
+                orig_buffer_samples = generator.buffer_samples
                 
                 # Generate and write buffers
                 for i in range(generator.num_buffers):
                     remaining = total_samples - samples_written
-                    actual_buffer_samples = min(generator.buffer_samples, remaining)
+                    actual_buffer_samples = min(orig_buffer_samples, remaining)
                     
-                    # Adjust buffer size for last buffer if needed
-                    if actual_buffer_samples < generator.buffer_samples:
-                        generator.buffer_samples = actual_buffer_samples
+                    # Temporarily adjust buffer size for this iteration only
+                    generator.buffer_samples = actual_buffer_samples
                     
-                    # Generate buffer
-                    buffer, _ = generator.generate_buffer()
+                    # Generate buffer with appropriate format
+                    buffer, _ = generator.generate_buffer(subtype)
                     
                     # Write to file
                     f.write(buffer)
@@ -529,6 +558,9 @@ class BabyNoiseApp:
                     # Update progress (on main thread)
                     progress = samples_written / total_samples * 100
                     self.root.after(0, lambda p=progress: self.update_progress(p))
+                
+                # Restore original buffer size
+                generator.buffer_samples = orig_buffer_samples
             
             # Update UI from main thread
             self.root.after(0, lambda: self._render_complete(output_path))
@@ -581,6 +613,95 @@ class BabyNoiseApp:
         
         # Update visualization
         self.update_visualization()
+    
+    def randomize_seed(self):
+        """Generate a random seed"""
+        seed = np.random.randint(0, 2**32 - 1)
+        self.seed_var.set(str(seed))
+    
+    def update_visualization(self):
+        """Update the visualization plots"""
+        # Update spectral lines
+        x = np.logspace(np.log10(20), np.log10(20000), 100)
+        
+        # White noise (flat)
+        white_y = np.zeros_like(x) - 3.0
+        
+        # Pink noise (-3 dB/octave)
+        pink_y = -10 * np.log10(x / 20) - 3.0
+        
+        # Brown noise (-6 dB/octave)
+        brown_y = -20 * np.log10(x / 20) - 3.0
+        
+        # Apply high-pass for brown
+        brown_y[x < 20] = -30
+        
+        # Mix according to color mix
+        total = self.white_var.get() + self.pink_var.get() + self.brown_var.get()
+        if total > 0:
+            mix_y = (self.white_var.get() * np.power(10, white_y/10) + 
+                    self.pink_var.get() * np.power(10, pink_y/10) + 
+                    self.brown_var.get() * np.power(10, brown_y/10)) / total
+            mix_y = 10 * np.log10(mix_y)
+        else:
+            mix_y = white_y
+        
+        # Update lines
+        self.white_line.set_ydata(white_y)
+        self.pink_line.set_ydata(pink_y)
+        self.brown_line.set_ydata(brown_y)
+        self.mix_line.set_ydata(mix_y)
+        
+        # Update target level in level meter
+        x_range = np.linspace(0, 10, 100)
+        self.target_line.set_data(x_range, np.ones_like(x_range) * self.rms_var.get())
+        
+        # Redraw canvas
+        self.canvas.draw()
+    
+    def update_ui(self):
+        """Update UI elements (called periodically)"""
+        # Update RMS display
+        if self.streaming:
+            self.rms_label.configure(text=f"Current: {self.current_rms:.1f} dB")
+            
+            # Update label color based on safety threshold
+            if self.current_rms > SAFETY_RMS_THRESHOLD:
+                self.rms_label.configure(foreground="red")
+            else:
+                self.rms_label.configure(foreground="")
+            
+            # Update level meter
+            if self.rms_history:
+                x = np.linspace(0, 10, len(self.rms_history))
+                self.level_line.set_data(x, self.rms_history)
+                self.level_ax.set_xlim(0, 10)
+                self.canvas.draw()
+        
+        # Schedule next update
+        self.root.after(UPDATE_INTERVAL, self.update_ui)
+
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description="Baby-Noise Generator GUI")
+    args = parser.parse_args()
+    
+    # Create output directory
+    os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
+    
+    # Create the root window
+    root = tk.Tk()
+    
+    # Create the app
+    app = BabyNoiseApp(root)
+    
+    # Start the main loop
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
     
     def load_preset(self, preset_name):
         """Load a preset from the presets dictionary"""
@@ -671,86 +792,3 @@ class BabyNoiseApp:
         
         # Update visualization
         self.update_visualization()
-    
-    def randomize_seed(self):
-        """Generate a random seed"""
-        seed = np.random.randint(0, 2**32 - 1)
-        self.seed_var.set(str(seed))
-    
-    def update_visualization(self):
-        """Update the visualization plots"""
-        # Update spectral lines
-        x = np.logspace(np.log10(20), np.log10(20000), 100)
-        
-        # White noise (flat)
-        white_y = np.zeros_like(x) - 3.0
-        
-        # Pink noise (-3 dB/octave)
-        pink_y = -10 * np.log10(x / 20) - 3.0
-        
-        # Brown noise (-6 dB/octave)
-        brown_y = -20 * np.log10(x / 20) - 3.0
-        
-        # Apply high-pass for brown
-        brown_y[x < 20] = -30
-        
-        # Mix according to color mix
-        total = self.white_var.get() + self.pink_var.get() + self.brown_var.get()
-        if total > 0:
-            mix_y = (self.white_var.get() * np.power(10, white_y/10) + 
-                    self.pink_var.get() * np.power(10, pink_y/10) + 
-                    self.brown_var.get() * np.power(10, brown_y/10)) / total
-            mix_y = 10 * np.log10(mix_y)
-        else:
-            mix_y = white_y
-        
-        # Update lines
-        self.white_line.set_ydata(white_y)
-        self.pink_line.set_ydata(pink_y)
-        self.brown_line.set_ydata(brown_y)
-        self.mix_line.set_ydata(mix_y)
-        
-        # Update target level in level meter
-        x_range = np.linspace(0, 10, 100)
-        self.target_line.set_data(x_range, np.ones_like(x_range) * self.rms_var.get())
-        
-        # Redraw canvas
-        self.canvas.draw()
-    
-    def update_ui(self):
-        """Update UI elements (called periodically)"""
-        # Update RMS display
-        if self.streaming:
-            self.rms_label.configure(text=f"Current: {self.current_rms:.1f} dB")
-            
-            # Update level meter
-            if self.rms_history:
-                x = np.linspace(0, 10, len(self.rms_history))
-                self.level_line.set_data(x, self.rms_history)
-                self.level_ax.set_xlim(0, 10)
-                self.canvas.draw()
-        
-        # Schedule next update
-        self.root.after(UPDATE_INTERVAL, self.update_ui)
-
-
-def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="Baby-Noise Generator GUI")
-    args = parser.parse_args()
-    
-    # Create output directory
-    os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
-    
-    # Create the root window
-    root = tk.Tk()
-    
-    # Create the app
-    app = BabyNoiseApp(root)
-    
-    # Start the main loop
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()

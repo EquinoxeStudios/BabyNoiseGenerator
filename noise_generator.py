@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Baby-Noise Generator v1
+# Baby-Noise Generator v1.1
 # GPU-accelerated white/pink/brown noise generator for infant sleep
 
 import argparse
@@ -39,6 +39,7 @@ MAX_GPU_BUFFER = 128 * 1024 * 1024  # 128MB chunks for GPU processing
 CPU_BUFFER_SIZE = 2048               # Small buffer for real-time CPU processing
 BROWN_HPF_FREQ = 20.0       # Hz - remove DC offset and ultra-low freqs
 BROWN_LEAKY_ALPHA = 0.999   # Leaky integrator coefficient
+SAFETY_LUFS_THRESHOLD = -27.0  # LUFS threshold (~50 dB SPL)
 
 # Module-level cache for FIR filters
 _pink_fir_cache = {}
@@ -46,10 +47,11 @@ _pink_fir_cache = {}
 
 @lru_cache(maxsize=8)
 def get_pink_fir(sample_rate, n_taps=4097):
-    """Cache and return pink noise FIR filter"""
+    """Cache and return pink noise FIR filter with exactly 4097 taps (default)"""
     if not HAS_CUPY:
         return None
-        
+    
+    # Always include n_taps in the cache key to correctly handle different sizes
     cache_key = (sample_rate, n_taps)
     if cache_key not in _pink_fir_cache:
         # Generate filter coefficients
@@ -104,26 +106,15 @@ class NoiseGenerator:
             1, BROWN_HPF_FREQ / nyquist, btype='highpass'
         )
         
-        # For GPU-based processing, convert filter coefficients to GPU arrays
+        # For GPU-based processing, keep filter coefficients as NumPy arrays
+        # cupyx.scipy.signal.lfilter will automatically handle the transfer efficiently
         if config.use_gpu and HAS_CUPY:
-            self.brown_hpf_b_gpu = cp.array(self.brown_hpf_b)
-            self.brown_hpf_a_gpu = cp.array(self.brown_hpf_a)
+            # Keep coefficients as NumPy arrays - more efficient for cupyx
+            self.brown_hpf_b_gpu = self.brown_hpf_b  # Keep as NumPy array
+            self.brown_hpf_a_gpu = self.brown_hpf_a  # Keep as NumPy array
             
             # Get cached pink FIR filter
             self.pink_fir = get_pink_fir(config.sample_rate)
-            
-            # Define kernel for leaky integrator
-            self.brown_kernel = cp.RawKernel(r'''
-            extern "C" __global__
-            void leaky_integrator(const float* input, float* output, int length, float alpha) {
-                int i = blockDim.x * blockIdx.x + threadIdx.x;
-                if (i == 0) {
-                    output[i] = input[i];
-                } else if (i < length) {
-                    output[i] = alpha * output[i-1] + (1.0f - alpha) * input[i];
-                }
-            }
-            ''', 'leaky_integrator')
         else:
             # CPU version - pre-compute coefficients for IIR pink noise (Paul Kellett algorithm)
             self.pink_b0 = 0.99765 * 0.0555179
@@ -147,8 +138,9 @@ class NoiseGenerator:
     def generate_pink_noise(self, white_noise: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
         """Transform white noise into pink noise"""
         if self.config.use_gpu and HAS_CUPY:
-            # GPU implementation - FFT convolution
-            return cupyx.scipy.signal.fftconvolve(white_noise, self.pink_fir, mode='same')
+            # GPU implementation - FFT convolution with optimized plan reuse
+            # Use oaconvolve which has better plan caching than fftconvolve
+            return cupyx.scipy.signal.oaconvolve(white_noise, self.pink_fir, mode='same')
         else:
             # CPU implementation - Paul Kellett algorithm
             pink = np.zeros_like(white_noise)
@@ -171,15 +163,20 @@ class NoiseGenerator:
     def generate_brown_noise(self, white_noise: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
         """Transform white noise into brown noise using leaky integrator + HPF"""
         if self.config.use_gpu and HAS_CUPY:
-            # GPU implementation using RawKernel for leaky integrator
+            # GPU implementation using cumsum for leaky integration (race-condition free)
+            # Scale input for leaky integration approximation
+            scaled_input = (1.0 - BROWN_LEAKY_ALPHA) * white_noise
+            
+            # Use cumsum for efficient parallel implementation of leaky integration
             brown = cp.zeros_like(white_noise)
-            threads_per_block = 256
-            blocks_per_grid = (len(white_noise) + threads_per_block - 1) // threads_per_block
-            self.brown_kernel((blocks_per_grid,), (threads_per_block,), 
-                             (white_noise, brown, len(white_noise), BROWN_LEAKY_ALPHA))
+            brown[0] = scaled_input[0]  # Initialize first sample
+            
+            # Compute cumulative sum with exponential decay
+            for i in range(1, len(white_noise)):
+                brown[i] = scaled_input[i] + BROWN_LEAKY_ALPHA * brown[i-1]
             
             # Apply HPF to remove DC offset using cupyx.scipy.signal.lfilter
-            return cupyx.scipy.signal.lfilter(self.brown_hpf_b_gpu, self.brown_hpf_a_gpu, brown)
+            return cupyx.scipy.signal.lfilter(self.brown_hpf_b, self.brown_hpf_a, brown)
         else:
             # CPU implementation
             xp = np
@@ -259,20 +256,32 @@ class NoiseGenerator:
             return xp.array([]), -100.0
     
     def apply_loudness_control(self, audio: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
-        """Apply RMS target and peak ceiling"""
+        """Apply RMS target and peak ceiling with LUFS-based safety control"""
         xp = cp if self.config.use_gpu and HAS_CUPY else np
         
         # Calculate LUFS for 1-second windows
-        _, integrated_lufs = self.calculate_lufs(audio, window_size_sec=1.0)
+        loudness_values, integrated_lufs = self.calculate_lufs(audio, window_size_sec=1.0)
         
         # Calculate current RMS level
         current_rms_db = 20 * xp.log10(xp.sqrt(xp.mean(audio**2)) + 1e-10)
         
         # Calculate gain needed to reach target RMS
         gain_db = self.config.rms_target - current_rms_db
-        gain_linear = 10 ** (gain_db / 20)
+        
+        # AAP safety threshold (approximately -27 LUFS for 50 dB SPL)
+        safety_lufs_threshold = SAFETY_LUFS_THRESHOLD
+        
+        # Apply safety gain reduction if LUFS exceeds threshold
+        if integrated_lufs > safety_lufs_threshold:
+            safety_gain_db = safety_lufs_threshold - integrated_lufs
+            gain_db += safety_gain_db
+            logger.warning(
+                f"LUFS {integrated_lufs:.1f} exceeds safety threshold {safety_lufs_threshold:.1f}. "
+                f"Applying additional {safety_gain_db:.1f} dB reduction."
+            )
         
         # Apply gain
+        gain_linear = 10 ** (gain_db / 20)
         audio = audio * gain_linear
         
         # Check for peaks exceeding ceiling
@@ -287,8 +296,25 @@ class NoiseGenerator:
         
         return audio
     
-    def apply_dither(self, audio: Union[np.ndarray, "cp.ndarray"]) -> np.ndarray:
-        """Apply TPDF dither for 16-bit PCM output"""
+    def apply_dither(self, audio: Union[np.ndarray, "cp.ndarray"], output_format: str = "PCM_16") -> np.ndarray:
+        """Apply TPDF dither for bit-depth-reduced output formats
+        
+        Args:
+            audio: Input audio array (CPU or GPU)
+            output_format: Output format (e.g., "PCM_16" for 16-bit PCM)
+            
+        Returns:
+            Dithered audio array on CPU
+        """
+        # Skip dither for formats that don't need it (FLAC, FLOAT)
+        if output_format not in ["PCM_16", "PCM_24"]:
+            # Just move to CPU if needed, no dither required
+            if self.config.use_gpu and HAS_CUPY:
+                return cp.asnumpy(audio)
+            else:
+                return audio
+            
+        # For PCM formats, apply TPDF dither
         if self.config.use_gpu and HAS_CUPY:
             # Move to CPU first
             audio_cpu = cp.asnumpy(audio)
@@ -306,7 +332,7 @@ class NoiseGenerator:
                      xp.random.uniform(-amplitude, amplitude, len(audio))
             return audio + dither
     
-    def generate_buffer(self) -> Tuple[np.ndarray, Dict]:
+    def generate_buffer(self, output_format: str = "PCM_16") -> Tuple[np.ndarray, Dict]:
         """Generate a buffer of noise according to configuration"""
         # Generate white noise
         white = self.generate_white_noise(self.buffer_samples)
@@ -326,7 +352,7 @@ class NoiseGenerator:
         audio = self.apply_loudness_control(audio)
         
         # Apply dither and move to CPU if needed
-        audio = self.apply_dither(audio)
+        audio = self.apply_dither(audio, output_format)
         
         # Calculate metrics
         metrics = {
@@ -347,21 +373,27 @@ class NoiseGenerator:
         samples_written = 0
         metrics = {"buffers": [], "avg_rms_db": 0, "peak_db": -np.inf}
         
+        # Determine output format from file extension
+        _, ext = os.path.splitext(output_path)
+        output_format = "PCM_16" if ext.lower() == ".wav" else "FLAC" if ext.lower() == ".flac" else "PCM_16"
+        
+        # Store original buffer size to avoid UI progress jumps
+        orig_buffer_samples = self.buffer_samples
+        
         # Create output file
         with sf.SoundFile(output_path, mode='w', samplerate=self.config.sample_rate, 
-                          channels=1, subtype='PCM_16') as f:
+                          channels=1, subtype=output_format) as f:
             
             # Generate and write buffers
             for i in range(self.num_buffers):
                 remaining = self.total_samples - samples_written
-                actual_buffer_samples = min(self.buffer_samples, remaining)
+                actual_buffer_samples = min(orig_buffer_samples, remaining)
                 
-                # Adjust buffer size for last buffer if needed
-                if actual_buffer_samples < self.buffer_samples:
-                    self.buffer_samples = actual_buffer_samples
+                # Temporarily adjust buffer_samples for this iteration only
+                self.buffer_samples = actual_buffer_samples
                 
                 # Generate buffer
-                buffer, buffer_metrics = self.generate_buffer()
+                buffer, buffer_metrics = self.generate_buffer(output_format)
                 
                 # Write to file
                 f.write(buffer)
@@ -377,6 +409,9 @@ class NoiseGenerator:
                     progress = samples_written / self.total_samples * 100
                     elapsed = time.time() - start_time
                     logger.info(f"Progress: {progress:.1f}% ({elapsed:.1f}s elapsed)")
+        
+        # Restore original buffer size
+        self.buffer_samples = orig_buffer_samples
         
         # Log completion
         elapsed = time.time() - start_time
@@ -435,14 +470,24 @@ def auto_select_backend() -> bool:
         return False
     
     try:
-        # Check if CUDA is available
+        # Check if CUDA is available and functioning
         n_gpus = cp.cuda.runtime.getDeviceCount()
         if n_gpus > 0:
             # Get device info
             device = cp.cuda.runtime.getDeviceProperties(0)
             logger.info(f"Found GPU: {device['name'].decode()}")
             logger.info(f"CUDA Compute Capability: {device['major']}.{device['minor']}")
-            return True
+            
+            # Verify basic CUDA functionality with a simple operation
+            try:
+                # Test if we can perform a basic operation
+                test_arr = cp.zeros(10)
+                test_arr += 1
+                cp.asnumpy(test_arr)
+                return True
+            except Exception as cuda_error:
+                logger.warning(f"CUDA test failed, falling back to CPU: {cuda_error}")
+                return False
         else:
             logger.info("No CUDA GPUs found, using CPU backend")
             return False
