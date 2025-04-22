@@ -143,8 +143,14 @@ class NoiseGenerator:
     def generate_white_noise(self, length: int) -> np.ndarray:
         """Generate white noise using Philox PRNG"""
         if self.config.use_gpu and HAS_CUPY:
-            # GPU implementation using new Generator API
-            return self.rng.normal(0, 1, length, dtype=cp.float32)
+            # GPU implementation using Generator API
+            # In newer CuPy versions, the method is 'standard_normal' not 'normal'
+            try:
+                # Try newer API first
+                return self.rng.standard_normal(size=length, dtype=cp.float32)
+            except AttributeError:
+                # Fall back to older API if needed
+                return self.rng.normal(0, 1, length, dtype=cp.float32)
         else:
             # CPU implementation
             return self.rng.normal(0, 1, length).astype(np.float32)
