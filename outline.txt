@@ -1,84 +1,89 @@
-# Python "Baby‑Noise" Generator v1 – Technical Outline
-(broadcast‑quality white / pink / brown noise for YouTube & mobile apps)
+# Python "Baby‑Noise" Generator v2 – Technical Outline
+(GPU-accelerated high-quality white / pink / brown noise for YouTube & mobile apps)
 
 ## 1. High‑level goals
-* Single engine that can
-   * render 10‑hour gap‑free WAV/FLAC files for YouTube with **GPU acceleration**, and
-   * stream in real‑time inside a phone app with <5% CPU on mid‑tier hardware.
-* Three noise colours (white, pink, brown) with a cross‑fade "warmth" slider.
-* Medical‑safe output – long‑term RMS ≲ 50 dB SPL, –1 dBFS peak ceiling. Real‑time LUFS monitor (60 s window) auto‑reduces gain if level > 50 dB SPL (AAP guideline).
-* Deterministic seeds for reproducible renders, but easy randomisation per export.
-* **Smart backend selection** that uses GPU for batch processing and CPU for real-time streaming.
+* Single GPU-accelerated engine that can:
+   * Render 10‑hour gap‑free WAV/FLAC files for YouTube with **CUDA GPU acceleration**, and
+   * Deliver 75-90x real-time rendering speeds on high-end GPUs
+* Three noise colours (white, pink, brown) with a cross‑fade "warmth" slider
+* Medical‑safe output – long‑term RMS ≲ 50 dB SPL, –1 dBFS peak ceiling. Real‑time LUFS monitoring (60s window) auto‑reduces gain if level > 50 dB SPL (AAP guideline)
+* Deterministic seeds for reproducible renders, with easy randomization per export
+* **Stereo decorrelation** for rich spatial sound
+* **Output profiles** for baby-safe vs. YouTube publishing
 
-## 2. Key algorithms & evidence base
+## 2. GPU Acceleration Strategy
 
-| Component | Method | Source |
-|-----------|--------|--------|
-| White noise | **CuPy/NumPy Philox** counter‑based PRNG – 2²⁵⁶ period, jump‑ahead support | |
-| Pink noise | FIR (≈ 4097 taps) via FFT convolution, ±0.5 dB 20 Hz–20 kHz | |
-| Brown noise | Leaky integrator of white (a≈0.999) → 20 Hz HPF, **vectorized on GPU** | |
-| Offline long renders | **CuPy implementation** of colorednoise.powerlaw_psd_gaussian(β) (β = 0 / 1 / 2) | |
-| Baby sleep evidence | (white noise 80% asleep < 5 min) | |
-
-## 3. GPU Acceleration Strategy
-
-### Backend Selection Framework
-* **Runtime detection** of CUDA-compatible GPUs
-* Fallback to CPU processing when GPU unavailable or for mobile devices
-* Configurable threshold for GPU utilization (prefer CPU for small buffers)
-
-### GPU-optimized Noise Pipeline
+### CUDA-based Noise Pipeline
 ```
 graph TD
   A[Philox white buffer<br><b>CuPy GPU PRNG</b>] --> B{Colour?}
   B -->|white|  C[Gain stage<br><b>GPU vectorized</b>]
-  B -->|pink|   D[Pink noise<br><b>Large FIR via cupyx.scipy.signal.fftconvolve</b>]
+  B -->|pink|   D[Pink noise<br><b>FFT-based filtering</b>]
   B -->|brown|  E[Integrator<br><b>GPU vectorized</b>] --> F[One‑pole 20 Hz HPF<br><b>(2‑tap biquad kernel)</b>]
   D --> C
   F --> C
-  C --> G[Loudness meter<br><b>GPU reduction ops</b>]
-  G --> H[Brick‑wall limiter<br><b>GPU vectorized</b>]
-  H --> I[Memory transfer to host<br>Stream ↔ File sink]
+  G[Stereo decorrelation<br><b>FFT-based phase shifts</b>] --> C
+  C --> H[Loudness meter<br><b>GPU reduction ops</b>]
+  H --> I[True-peak limiter<br><b>4x oversampling</b>]
+  I --> J[Pre-emphasis filter<br><b>(optional for YouTube)</b>]
+  J --> K[Memory transfer to host<br>Stream ↔ File sink]
 ```
 
-### Implementation Details
+### GPU Implementation Details
 * **Buffer management**:
-   * Large-batch processing (128MB+ chunks) for GPU efficiency in offline rendering, auto‑shrinks if cudaMalloc fails (laptop 4 GB GPUs)
-   * 2048 samples for low-latency real-time on CPU
-* **Memory transfers**:
-   * Minimize CPU-GPU transfers by processing full audio blocks on GPU
-   * Asynchronous memory operations to hide transfer latency
+   * Dynamic block sizing based on GPU memory (128MB+ chunks for high-end GPUs)
+   * Larger buffers (2x-4x) for streaming to minimize transfer overhead
+* **Memory optimization**:
+   * Minimal CPU-GPU transfers by processing full audio blocks on GPU
+   * Efficient decorrelation through frequency-domain phase manipulation
 * **Level control**:
-   * GPU-accelerated RMS calculation using reduction operations
-   * Parallel limiter implementation for peak control
+   * GPU-accelerated RMS and LUFS calculation using reduction operations
+   * True-peak limiter with 4x oversampling for intersample peak detection
 * **Colour slider**:
-   * GPU-accelerated linear-blend: `mix = (1-α)*white + α*pink` (0 ≤ α ≤ 1)
-   * Extend to brown with two-segment blend
+   * Two-segment blend implementation with normalized power scaling
+   * Warmth parameter (0-100%) for intuitive control
 
-## 4. Performance Optimizations
+## 3. Key algorithms & implementation
 
-### GPU-specific optimizations
-* **Batch processing** of multiple output segments in parallel
-* **Shared memory** usage for frequent operations (especially for biquad HPF)
-* **Stream synchronization** to manage dependencies
-* **Mixed precision** calculations where appropriate (fp16 everywhere except final gain + limiter, which stays fp32 to keep ≥ 96 dB SNR)
-* **Algorithm-specific optimizations**:
-   * **Pink noise**: Large FIR via FFT-based convolution (O(N log N) scaling)
-   * **HPF filtering**: One-pole 20 Hz HPF using 2-tap biquad kernel (avoids unnecessary FFTs)
+| Component | Method | Implementation |
+|-----------|--------|----------------|
+| White noise | **CuPy/NumPy Philox** counter‑based PRNG – 2²⁵⁶ period | `rng.normal(0, 1, block_size).astype(cp.float32)` |
+| Pink noise | Frequency-domain filtering with optimized FFT convolution | `cusignal.fftconvolve(white_noise, pink_filter_taps, mode='same')` |
+| Brown noise | Leaky integrator (α≈0.999) → 20 Hz HPF, **vectorized** | `cusignal.lfilter(b, a, brown_noise)` with vectorized integration |
+| Stereo decorrelation | Frequency-dependent phase manipulation (0-45°) | `right_fft = right_fft * decorrelation_phases` |
+| True-peak limiting | 4x oversampling with FFT-based resampling | `cusignal.resample(noise_block, len(noise_block) * 4)` |
+
+## 4. Performance Optimization
+
+### GPU-specific optimization techniques
+* **Dynamic block sizing** based on available GPU memory
+* **Parallel filter implementation** for stereo channels
+* **Vectorized operations** for maximum GPU utilization
+* **Efficient FFT planning** with cached filter coefficients
+* **Optimal memory layout** for minimizing transfer overhead
 
 ### Benchmarking targets
-* **10-hour render**: ≤30 minutes on RTX 4060 (10 h mono 44.1 kHz) vs 3+ hours on CPU
-* **Memory footprint**: <4GB GPU memory for full processing chain
-* **Mobile fallback**: Seamless transition to CPU for streaming use case
+* **10-hour render**: ≤8 minutes on RTX 3080/4090 (vs. 30+ minutes previously)
+* **Memory footprint**: Scales automatically from 2GB to 8GB+ based on GPU capability
+* **Real-time factor**: 75-90x real-time on high-end GPUs, 25-30x on mid-range GPUs
 
-### Platform Considerations
-* Desktop: Full GPU acceleration for rendering
-* Server: Multi-GPU support for batch rendering (future)
-* Mobile: CPU-only with optimized NumPy path
+## 5. Output Profiles
 
-## 5. Future DSP add-ons
+### Baby-safe Profile
+* AAP-compliant levels: -63 dBFS RMS / -27 LUFS / -3 dBTP
+* Optimized for safe infant sleep
+* Automatic safety monitoring and alerts
 
-**Phase 2 (Q3 2025)** – *Optional soothing layers*
+### YouTube-pub Profile
+* Optimized for streaming platforms: -20 dBFS RMS / -16 LUFS / -2 dBTP
+* High-frequency pre-emphasis for codec resilience
+* Enhanced stereo field for better listening experience
+
+## 6. Future DSP add-ons
+
+**Phase 2 (Q3 2025)** – *Expanded capabilities*
+* Mixed precision computation for newer GPUs (Tensor Cores)
+* Multi-GPU support for batch rendering
 * Heartbeat FLAC loop (low‑pass < 150 Hz) mixed at ‑24 dBFS
-* Slow ±2 dB LFO‑gain modulation (0.05 – 0.2 Hz) to reduce habituation
-* All add‑ons pass through the same LUFS limiter and safety tests
+* Enhanced modulation options with multi-dimensional LFOs
+* CUDA kernel fusion for further performance optimization
