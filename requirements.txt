@@ -1,14 +1,14 @@
-# Baby-Noise Generator v1.1 - Requirements
+# Baby-Noise Generator v1.2 - Requirements (Simplified)
 # Core dependencies
 numpy>=1.20.0
 scipy>=1.7.0
 soundfile>=0.10.0
 sounddevice>=0.4.5
-matplotlib>=3.5.0
 pyyaml>=5.1.0
 pyloudnorm>=0.1.0  # For ITU-R BS.1770-4 compliant LUFS measurements
 pytest>=7.0.0
 
 # Optional GPU acceleration
-# cupy>=12.0.0
-# cupyx-scipy>=12.0.0
+# For CUDA 11.x: cupy-cuda11x>=12.0.0
+# For CUDA 12.x: cupy-cuda12x>=12.0.0
+# Run: python -m cupyx.tools.install_library --cuda 12.x

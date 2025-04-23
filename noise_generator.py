@@ -1,1047 +1,936 @@
 #!/usr/bin/env python3
-# Baby-Noise Generator v1.2
-# GPU-accelerated white/pink/brown noise generator for infant sleep
+# Baby-Noise Generator App v1.2
+# GUI application for the Baby-Noise Generator
 
-import argparse
 import os
+import sys
 import time
-import yaml
+import threading
+import queue
 import numpy as np
-import scipy.signal
-import soundfile as sf
-import tempfile
-import contextlib
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union, List, BinaryIO
+import sounddevice as sd
+import argparse
+import yaml
 import logging
-from functools import lru_cache
+from pathlib import Path
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+import soundfile as sf
 
-# Add pyloudnorm for ITU-R BS.1770-4 compliant LUFS calculation
-try:
-    import pyloudnorm as pyln
-    HAS_PYLOUDNORM = True
-except ImportError:
-    HAS_PYLOUDNORM = False
-
-# Optional GPU dependencies
-try:
-    import cupy as cp
-    import cupyx.scipy.signal
-    HAS_CUPY = True
-except ImportError:
-    HAS_CUPY = False
-    cp = None
+# Import our noise generator module
+from noise_generator import (
+    NoiseConfig, StreamingNoiseGenerator, NoiseGenerator, 
+    load_preset, auto_select_backend, SAMPLE_RATE,
+    NOISE_PROFILES, generate_stereo_noise, measure_true_peak
+)
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("baby-noise")
+logger = logging.getLogger("baby-noise-app")
 
 # Constants
-SAMPLE_RATE = 44100
-DEFAULT_PEAK_CEILING = -1.0  # dBFS
-DEFAULT_RMS_TARGET = -63.0   # dBFS (~47 dB SPL)
-DEFAULT_DURATION = 600       # seconds
-MAX_GPU_BUFFER = 128 * 1024 * 1024  # 128MB chunks for GPU processing
-CPU_BUFFER_SIZE = 2048               # Small buffer for real-time CPU processing
-BROWN_HPF_FREQ = 20.0       # Hz - remove DC offset and ultra-low freqs
-BROWN_LEAKY_ALPHA = 0.999   # Leaky integrator coefficient
-SAFETY_LUFS_THRESHOLD = -27.0  # LUFS threshold (~50 dB SPL)
-MAX_FILE_SIZE_FOR_DIRECT_READ = 100 * 1024 * 1024  # 100MB - threshold for single-read vs. chunked
-
-# Module-level cache for FIR filters
-_pink_fir_cache = {}
+APP_TITLE = "Baby-Noise Generator v1.2"
+DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Documents/BabyNoise")
+BUFFER_SIZE = 2048  # Audio buffer size for streaming
+UPDATE_INTERVAL = 50  # ms between UI updates
 
 
-@contextlib.contextmanager
-def temp_wav_file():
-    """Context manager for temporary wave file that ensures cleanup"""
-    with tempfile.NamedTemporaryFile(suffix='.raw.wav', delete=False) as tmp:
-        temp_path = tmp.name
-    try:
-        yield temp_path
-    finally:
+class BabyNoiseApp:
+    """GUI application for the Baby-Noise Generator"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title(APP_TITLE)
+        self.root.minsize(800, 600)
+        
+        # Set up variables
+        self.streaming = False
+        self.recording = False
+        self.stream = None
+        self.audio_queue = queue.Queue(maxsize=20)
+        self.generator = None
+        self.output_path = None
+        
+        # Load presets
+        self.preset_path = os.path.join(os.path.dirname(__file__), "presets.yaml")
+        with open(self.preset_path, 'r') as f:
+            self.presets = yaml.safe_load(f)['presets']
+        
+        # Set up UI variables
+        self.preset_var = tk.StringVar(value="default")
+        self.seed_var = tk.StringVar(value="auto")
+        self.white_var = tk.DoubleVar(value=0.4)
+        self.pink_var = tk.DoubleVar(value=0.4)
+        self.brown_var = tk.DoubleVar(value=0.2)
+        self.warmth_var = tk.DoubleVar(value=50)  # 0-100 scale for UI
+        self.rms_var = tk.DoubleVar(value=-63.0)
+        self.duration_var = tk.IntVar(value=600)  # 10 minutes
+        self.lfo_var = tk.DoubleVar(value=0.1)
+        self.lfo_enabled_var = tk.BooleanVar(value=True)
+        self.progress_var = tk.DoubleVar(value=0.0)  # Progress for rendering
+        self.profile_var = tk.StringVar(value="baby-safe")
+        self.channels_var = tk.IntVar(value=1)  # 1=mono, 2=stereo
+        self.output_format_var = tk.StringVar(value="WAV (24-bit)")
+        
+        # Current metrics
+        self.current_rms = -100.0
+        self.current_peak = -100.0
+        self.rms_history = []
+        
+        # Create UI
+        self.create_ui()
+        
+        # Initialize audio
+        self.initialize_audio()
+        
+        # Load default preset
+        self.load_preset("default")
+        
+        # Update UI every 50ms
+        self.root.after(UPDATE_INTERVAL, self.update_ui)
+    
+    def create_ui(self):
+        """Create the user interface"""
+        self._create_main_frame()
+        self._create_control_section()
+        self._create_playback_section()
+        self._create_render_section()
+        self._create_visualization()
+        self._create_status_bar()
+    
+    def _create_main_frame(self):
+        """Create the main application frame"""
+        self.main_frame = ttk.Frame(self.root, padding="10")
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+    
+    def _create_control_section(self):
+        """Create the noise control section"""
+        # Create top section (controls)
+        control_frame = ttk.LabelFrame(self.main_frame, text="Noise Controls")
+        control_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Preset selection
+        preset_frame = ttk.Frame(control_frame)
+        preset_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(preset_frame, text="Preset:").pack(side=tk.LEFT, padx=5)
+        preset_combobox = ttk.Combobox(preset_frame, textvariable=self.preset_var, 
+                                       values=list(self.presets.keys()))
+        preset_combobox.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        preset_combobox.bind("<<ComboboxSelected>>", self.on_preset_change)
+        
+        # Profile selection (new)
+        profile_frame = ttk.Frame(control_frame)
+        profile_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(profile_frame, text="Profile:").pack(side=tk.LEFT, padx=5)
+        profile_combobox = ttk.Combobox(profile_frame, textvariable=self.profile_var,
+                                       values=["baby-safe", "youtube-pub"])
+        profile_combobox.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        profile_combobox.bind("<<ComboboxSelected>>", self.on_profile_change)
+        
+        # Add profile info label
+        self.profile_info = ttk.Label(profile_frame, text="AAP-compliant safe levels", font=("", 8, "italic"))
+        self.profile_info.pack(side=tk.LEFT, padx=5)
+        
+        # Seed control
+        seed_frame = ttk.Frame(control_frame)
+        seed_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(seed_frame, text="Seed:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(seed_frame, textvariable=self.seed_var).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(seed_frame, text="Randomize", command=self.randomize_seed).pack(side=tk.LEFT, padx=5)
+        
+        # Channel selection (new)
+        channel_frame = ttk.Frame(control_frame)
+        channel_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(channel_frame, text="Channels:").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(channel_frame, text="Mono", variable=self.channels_var, value=1).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(channel_frame, text="Stereo", variable=self.channels_var, value=2).pack(side=tk.LEFT, padx=5)
+        
+        # Noise color blend controls
+        color_frame = ttk.LabelFrame(control_frame, text="Noise Color")
+        color_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Warmth slider (maps to color mix)
+        warmth_frame = ttk.Frame(color_frame)
+        warmth_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(warmth_frame, text="Brighter").pack(side=tk.LEFT, padx=5)
+        warmth_slider = ttk.Scale(warmth_frame, from_=0, to=100, orient=tk.HORIZONTAL, 
+                                 variable=self.warmth_var, command=self.on_warmth_change)
+        warmth_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Label(warmth_frame, text="Warmer").pack(side=tk.LEFT, padx=5)
+        
+        # Add warmth percentage label
+        self.warmth_label = ttk.Label(warmth_frame, text="50%")
+        self.warmth_label.pack(side=tk.LEFT, padx=5)
+        
+        # Manual color mix frame (advanced users)
+        manual_color_frame = ttk.Frame(color_frame)
+        manual_color_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(manual_color_frame, text="White:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
+        white_slider = ttk.Scale(manual_color_frame, from_=0, to=1, orient=tk.HORIZONTAL, 
+                                variable=self.white_var, command=self.on_color_change)
+        white_slider.grid(row=0, column=1, padx=5, pady=2, sticky=tk.EW)
+        
+        ttk.Label(manual_color_frame, text="Pink:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
+        pink_slider = ttk.Scale(manual_color_frame, from_=0, to=1, orient=tk.HORIZONTAL, 
+                               variable=self.pink_var, command=self.on_color_change)
+        pink_slider.grid(row=1, column=1, padx=5, pady=2, sticky=tk.EW)
+        
+        ttk.Label(manual_color_frame, text="Brown:").grid(row=2, column=0, padx=5, pady=2, sticky=tk.W)
+        brown_slider = ttk.Scale(manual_color_frame, from_=0, to=1, orient=tk.HORIZONTAL, 
+                                variable=self.brown_var, command=self.on_color_change)
+        brown_slider.grid(row=2, column=1, padx=5, pady=2, sticky=tk.EW)
+        
+        manual_color_frame.columnconfigure(1, weight=1)
+        
+        # Volume controls
+        volume_frame = ttk.LabelFrame(control_frame, text="Volume")
+        volume_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(volume_frame, text="Level (dB SPL):").pack(side=tk.LEFT, padx=5)
+        rms_slider = ttk.Scale(volume_frame, from_=-70, to=-55, orient=tk.HORIZONTAL, 
+                              variable=self.rms_var, command=self.on_rms_change)
+        rms_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # Current RMS display
+        self.rms_label = ttk.Label(volume_frame, text="Current: -- dB")
+        self.rms_label.pack(side=tk.LEFT, padx=5)
+        
+        # LFO controls
+        lfo_frame = ttk.LabelFrame(control_frame, text="Modulation")
+        lfo_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Checkbutton(lfo_frame, text="Enable gentle modulation", 
+                       variable=self.lfo_enabled_var).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Label(lfo_frame, text="Rate (Hz):").pack(side=tk.LEFT, padx=5)
+        lfo_slider = ttk.Scale(lfo_frame, from_=0.05, to=0.2, orient=tk.HORIZONTAL, 
+                              variable=self.lfo_var)
+        lfo_slider.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+    
+    def _create_playback_section(self):
+        """Create the playback controls section"""
+        playback_frame = ttk.LabelFrame(self.main_frame, text="Playback")
+        playback_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Play/Stop buttons
+        button_frame = ttk.Frame(playback_frame)
+        button_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.play_button = ttk.Button(button_frame, text="▶ Play", 
+                                     command=self.toggle_playback, width=15)
+        self.play_button.pack(side=tk.LEFT, padx=5)
+    
+    def _create_render_section(self):
+        """Create the render controls section"""
+        render_frame = ttk.LabelFrame(self.main_frame, text="Render")
+        render_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Duration and filename
+        duration_frame = ttk.Frame(render_frame)
+        duration_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(duration_frame, text="Duration:").pack(side=tk.LEFT, padx=5)
+        ttk.Combobox(duration_frame, textvariable=self.duration_var, 
+                    values=[300, 600, 1800, 3600, 7200, 36000]).pack(side=tk.LEFT, padx=5)
+        ttk.Label(duration_frame, text="seconds").pack(side=tk.LEFT)
+        
+        # Format selection
+        format_frame = ttk.Frame(render_frame)
+        format_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        ttk.Label(format_frame, text="Format:").pack(side=tk.LEFT, padx=5)
+        ttk.Combobox(format_frame, textvariable=self.output_format_var, 
+                    values=["WAV (16-bit)", "WAV (24-bit)", "FLAC"]).pack(side=tk.LEFT, padx=5)
+        
+        # Render button and progress bar
+        render_button_frame = ttk.Frame(render_frame)
+        render_button_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.render_button = ttk.Button(render_button_frame, text="Render to File...", 
+                                       command=self.render_to_file)
+        self.render_button.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        # Progress bar for rendering
+        self.progress_bar = ttk.Progressbar(render_frame, variable=self.progress_var, 
+                                           length=200, mode='determinate')
+        self.progress_bar.pack(fill=tk.X, padx=5, pady=5)
+    
+    def _create_visualization(self):
+        """Create the visualization section"""
+        # Separator
+        ttk.Separator(self.main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=5, pady=10)
+        
+        # Visualization area
+        viz_frame = ttk.LabelFrame(self.main_frame, text="Visualization")
+        viz_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Create matplotlib figure
+        self.fig = Figure(figsize=(5, 4), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=viz_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Create subplots
+        self.setup_plots()
+    
+    def _create_status_bar(self):
+        """Create the status bar"""
+        self.status_var = tk.StringVar(value="Ready")
+        self.status_bar = ttk.Label(self.main_frame, textvariable=self.status_var, 
+                                   relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(fill=tk.X, padx=5, pady=2)
+    
+    def setup_plots(self):
+        """Set up the visualization plots"""
+        self.fig.clear()
+        
+        # Two plots: spectrum and level meter
+        self.spectrum_ax = self.fig.add_subplot(121)
+        self.level_ax = self.fig.add_subplot(122)
+        
+        # Spectrum plot
+        self.spectrum_ax.set_title("Noise Spectrum")
+        self.spectrum_ax.set_xlabel("Frequency (Hz)")
+        self.spectrum_ax.set_ylabel("Amplitude (dB)")
+        self.spectrum_ax.set_xscale("log")
+        self.spectrum_ax.set_xlim(20, 20000)
+        self.spectrum_ax.set_ylim(-30, 0)
+        self.spectrum_ax.grid(True)
+        
+        # Plot spectrum lines (will be updated later)
+        x = np.logspace(np.log10(20), np.log10(20000), 100)
+        self.white_line, = self.spectrum_ax.plot(x, np.zeros_like(x), label="White")
+        self.pink_line, = self.spectrum_ax.plot(x, np.zeros_like(x), label="Pink")
+        self.brown_line, = self.spectrum_ax.plot(x, np.zeros_like(x), label="Brown")
+        self.mix_line, = self.spectrum_ax.plot(x, np.zeros_like(x), 'k--', linewidth=2, label="Mix")
+        self.spectrum_ax.legend()
+        
+        # Level meter
+        self.level_ax.set_title("Level Meter")
+        self.level_ax.set_xlabel("Time (s)")
+        self.level_ax.set_ylabel("Level (dB)")
+        self.level_ax.set_ylim(-70, -50)
+        self.level_ax.grid(True)
+        
+        # Create level history line
+        self.level_line, = self.level_ax.plot([], [], 'g-')
+        
+        # Target level line
+        self.target_line, = self.level_ax.plot([], [], 'r--')
+        
+        # Safety threshold line
+        # Get threshold based on profile
+        profile = NOISE_PROFILES.get(self.profile_var.get(), NOISE_PROFILES["baby-safe"])
+        safety_threshold = -60.0  # Default threshold
+        self.safety_line, = self.level_ax.plot([], [], 'r:', linewidth=1.5)
+        x_range = np.linspace(0, 10, 100)
+        self.safety_line.set_data(x_range, np.ones_like(x_range) * safety_threshold)
+        
+        self.fig.tight_layout()
+        self.canvas.draw()
+    
+    def initialize_audio(self):
+        """Initialize audio playback"""
+        # Check available audio devices
+        devices = sd.query_devices()
+        logger.info(f"Found {len(devices)} audio devices")
+        
+        # Use default output device
+        self.output_device = sd.default.device[1]
+        device_info = sd.query_devices(self.output_device)
+        logger.info(f"Using output device: {device_info['name']}")
+    
+    def audio_callback(self, outdata, frames, time, status):
+        """Audio callback for sounddevice"""
+        if status:
+            logger.warning(f"Audio callback status: {status}")
+        
         try:
-            os.unlink(temp_path)
-        except Exception as e:
-            logger.warning(f"Could not remove temporary file {temp_path}: {str(e)}")
-
-
-@lru_cache(maxsize=8)
-def get_pink_fir(sample_rate, n_taps=4097):
-    """Cache and return pink noise FIR filter with exactly 4097 taps (default)"""
-    if not HAS_CUPY:
-        return None
-    
-    # Always include n_taps in the cache key to correctly handle different sizes
-    cache_key = (sample_rate, n_taps)
-    if cache_key not in _pink_fir_cache:
-        # Generate filter coefficients
-        freq = cp.fft.rfftfreq(n_taps, 1/sample_rate)
-        freq[0] = freq[1]  # Avoid division by zero
-        response = 1.0 / cp.sqrt(freq)
-        impulse = cp.fft.irfft(response)
-        
-        # Fixed: Create window with the same size as impulse
-        window = cp.hanning(len(impulse))
-        
-        impulse = impulse * window
-        impulse = impulse / cp.sqrt(cp.sum(impulse**2))
-        _pink_fir_cache[cache_key] = impulse
-    
-    return _pink_fir_cache[cache_key]
-
-
-def process_audio_file(input_path: str, output_path: str, gain_db: float, 
-                      peak_limit_db: float, output_format: str = "PCM_16") -> None:
-    """Process audio file with gain and optional limiting/dithering
-    
-    Args:
-        input_path: Path to input audio file
-        output_path: Path to output audio file
-        gain_db: Gain to apply in dB
-        peak_limit_db: Maximum allowed peak in dBFS
-        output_format: Output format (e.g., "PCM_16" for 16-bit PCM)
-    """
-    # Calculate linear gain
-    linear_gain = 10 ** (gain_db / 20)
-    
-    # Get file info to determine processing strategy
-    info = sf.info(input_path)
-    file_size = os.path.getsize(input_path)
-    
-    # Choose processing strategy based on file size
-    if file_size < MAX_FILE_SIZE_FOR_DIRECT_READ:
-        # Small file: read all at once
-        logger.info(f"Processing {input_path} in single pass (size: {file_size/1024/1024:.1f} MB)")
-        
-        # Read entire file
-        audio, sr = sf.read(input_path)
-        
-        # Apply gain
-        audio = audio * linear_gain
-        
-        # Check for limiting
-        peak = np.max(np.abs(audio))
-        peak_db = 20 * np.log10(peak + 1e-10)
-        
-        if peak_db > peak_limit_db:
-            limiting_gain = 10 ** ((peak_limit_db - peak_db) / 20)
-            audio = audio * limiting_gain
-            logger.info(f"Applied limiting: {limiting_gain:.3f} ({peak_db:.1f} dBFS -> {peak_limit_db:.1f} dBFS)")
-        
-        # Apply dither if needed
-        if output_format in ["PCM_16", "PCM_24"]:
-            # Calculate appropriate dither amplitude based on bit depth
-            bits = 16 if output_format == "PCM_16" else 24
-            amplitude = 2.0 / (2**bits - 1)
+            if self.audio_queue.empty():
+                # Generate more audio if queue is empty
+                chunk = self.generator.get_next_chunk(BUFFER_SIZE)
+                
+                # Reshape for sounddevice if stereo
+                if len(chunk.shape) > 1 and chunk.shape[1] == 2:
+                    # Already in stereo format
+                    pass
+                elif self.channels_var.get() == 2:
+                    # Convert mono to stereo
+                    chunk = np.column_stack((chunk, chunk))
+                
+                self.audio_queue.put(chunk)
             
-            # Apply TPDF dither
-            dither = np.random.uniform(-amplitude, amplitude, len(audio)) - \
-                     np.random.uniform(-amplitude, amplitude, len(audio))
-            audio = audio + dither
-        
-        # Write output
-        sf.write(output_path, audio, sr, subtype=output_format)
-        
-    else:
-        # Large file: process in chunks
-        logger.info(f"Processing {input_path} in chunks (size: {file_size/1024/1024:.1f} MB)")
-        
-        # Process in ~5 second chunks
-        chunk_size = info.samplerate * 5
-        
-        with sf.SoundFile(input_path, 'r') as infile, \
-             sf.SoundFile(output_path, 'w', samplerate=infile.samplerate, 
-                         channels=infile.channels, subtype=output_format) as outfile:
+            # Get data from queue
+            data = self.audio_queue.get_nowait()
             
-            # Track progress
-            samples_processed = 0
-            last_logged_percent = -10  # Initialize to ensure first chunk logs
+            # Update metrics
+            self.current_rms = 20 * np.log10(np.sqrt(np.mean(data**2)) + 1e-10)
+            self.current_peak = 20 * np.log10(np.max(np.abs(data)) + 1e-10)
+            self.rms_history.append(self.current_rms)
+            if len(self.rms_history) > 100:
+                self.rms_history = self.rms_history[-100:]
             
-            while True:
-                chunk = infile.read(chunk_size)
-                if len(chunk) == 0:
-                    break
+            # Fill output buffer
+            if len(data) < len(outdata):
+                if data.ndim == 1:  # Mono
+                    outdata[:len(data), 0] = data
+                    outdata[len(data):, 0] = 0
+                else:  # Stereo/multi-channel
+                    outdata[:len(data)] = data
+                    outdata[len(data):] = 0
+            else:
+                if data.ndim == 1:  # Mono
+                    outdata[:, 0] = data[:len(outdata)]
+                else:  # Stereo/multi-channel
+                    outdata[:] = data[:len(outdata)]
                 
-                # Apply gain
-                chunk = chunk * linear_gain
-                
-                # Check for limiting in each chunk
-                peak = np.max(np.abs(chunk))
-                peak_db = 20 * np.log10(peak + 1e-10)
-                
-                if peak_db > peak_limit_db:
-                    limiting_gain = 10 ** ((peak_limit_db - peak_db) / 20)
-                    chunk = chunk * limiting_gain
-                
-                # Apply dither if needed
-                if output_format in ["PCM_16", "PCM_24"]:
-                    # Calculate appropriate dither amplitude based on bit depth
-                    bits = 16 if output_format == "PCM_16" else 24
-                    amplitude = 2.0 / (2**bits - 1)
-                    
-                    # Apply TPDF dither
-                    dither = np.random.uniform(-amplitude, amplitude, len(chunk)) - \
-                             np.random.uniform(-amplitude, amplitude, len(chunk))
-                    chunk = chunk + dither
-                
-                # Write to output file
-                outfile.write(chunk)
-                
-                # Update progress tracking
-                samples_processed += len(chunk)
-                progress_percent = samples_processed / infile.frames * 100
-                
-                # Log progress at 10% increments
-                if progress_percent - last_logged_percent >= 10 or progress_percent >= 100:
-                    logger.info(f"Processing progress: {progress_percent:.1f}%")
-                    last_logged_percent = progress_percent
-
-
-@dataclass
-class NoiseConfig:
-    """Configuration for noise generator"""
-    seed: int
-    duration: float
-    color_mix: Dict[str, float]
-    rms_target: float
-    peak_ceiling: float
-    lfo_rate: Optional[float] = None
-    sample_rate: int = SAMPLE_RATE
-    use_gpu: bool = False
-
-
-class NoiseGenerator:
-    """GPU-accelerated noise generator with CPU fallback"""
+        except queue.Empty:
+            # If queue is empty, fill with zeros
+            outdata.fill(0)
+            logger.warning("Audio buffer underrun")
     
-    def __init__(self, config: NoiseConfig):
-        self.config = config
-        self.xp = cp if config.use_gpu and HAS_CUPY else np
-        self.buffer_size = MAX_GPU_BUFFER if config.use_gpu and HAS_CUPY else CPU_BUFFER_SIZE
+    def start_streaming(self):
+        """Start audio streaming"""
+        if self.streaming:
+            return
         
-        # Initialize the PRNG with seed
-        if config.use_gpu and HAS_CUPY:
-            # Use newer Generator API with Philox algorithm for better performance
-            self.rng = cp.random.Generator(cp.random.Philox4x3210(config.seed))
-        else:
-            self.rng = np.random.RandomState(seed=config.seed)
+        # Create configuration for streaming
+        config, _ = self.create_config()
+        config.use_gpu = False  # Force CPU for streaming
         
-        # Calculate number of samples and buffers needed
-        self.total_samples = int(config.duration * config.sample_rate)
-        self.buffer_samples = min(self.buffer_size // 4, self.total_samples)  # 4 bytes per float32
-        self.num_buffers = (self.total_samples + self.buffer_samples - 1) // self.buffer_samples
+        # Create generator
+        self.generator = StreamingNoiseGenerator(config)
         
-        # Pre-calculate filter coefficients for brown noise HPF
-        nyquist = config.sample_rate / 2.0
-        brown_hpf_b, brown_hpf_a = scipy.signal.butter(
-            1, BROWN_HPF_FREQ / nyquist, btype='highpass'
+        # Clear audio queue
+        while not self.audio_queue.empty():
+            self.audio_queue.get()
+        
+        # Pre-fill queue with a few chunks
+        for _ in range(5):
+            chunk = self.generator.get_next_chunk(BUFFER_SIZE)
+            
+            # Reshape for sounddevice if stereo
+            if self.channels_var.get() == 2 and len(chunk.shape) == 1:
+                # Convert mono to stereo
+                chunk = np.column_stack((chunk, chunk))
+                
+            self.audio_queue.put(chunk)
+        
+        # Start audio stream
+        self.stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE,
+            channels=self.channels_var.get(),
+            callback=self.audio_callback,
+            blocksize=BUFFER_SIZE
         )
+        self.stream.start()
         
-        # Store both NumPy and CuPy versions for appropriate use
-        self.brown_hpf_b = brown_hpf_b
-        self.brown_hpf_a = brown_hpf_a
+        self.streaming = True
+        self.play_button.configure(text="⏹ Stop")
+        self.status_var.set("Playing...")
+    
+    def stop_streaming(self):
+        """Stop audio streaming"""
+        if not self.streaming:
+            return
         
-        # If using GPU, also store CuPy versions
-        if config.use_gpu and HAS_CUPY:
-            self.brown_hpf_b_gpu = cp.asarray(brown_hpf_b)
-            self.brown_hpf_a_gpu = cp.asarray(brown_hpf_a)
-            # Get cached pink FIR filter
-            self.pink_fir = get_pink_fir(config.sample_rate)
+        # Stop stream
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+        
+        self.streaming = False
+        self.play_button.configure(text="▶ Play")
+        self.status_var.set("Stopped")
+        
+        # Clear audio queue
+        while not self.audio_queue.empty():
+            self.audio_queue.get()
+    
+    def toggle_playback(self):
+        """Toggle audio playback"""
+        if self.streaming:
+            self.stop_streaming()
         else:
-            # IMPROVED: Initialize coefficients for Voss-McCartney algorithm (12-stage) for CPU pink noise
-            self.pink_octaves = 12  # Number of octaves for Voss-McCartney
-            self.pink_state = np.zeros(self.pink_octaves)
-            self.pink_last_value = 0.0
-            
-            # Keep Paul Kellett coefficients for legacy support
-            self.pink_b0 = 0.99765 * 0.0555179
-            self.pink_b1 = 0.96300 * 0.0750759
-            self.pink_b2 = 0.57000 * 0.1538520
-            self.pink_b3 = -0.06000 * 0.3104856
-            self.pink_b4 = -0.53200 * 0.5329522
-            self.pink_b5 = -0.58200 * 0.7234423
-            self.pink_b6 = 0.50700 * 0.0168980
-            self.pink_mem = np.zeros(7)  # State variables
-            
-        # Initialize LUFS meter if pyloudnorm is available
-        if HAS_PYLOUDNORM:
-            self.lufs_meter = pyln.Meter(self.config.sample_rate)
-            
-    def generate_white_noise(self, length: int) -> np.ndarray:
-        """Generate white noise using Philox PRNG"""
-        if self.config.use_gpu and HAS_CUPY:
-            # GPU implementation using Generator API
-            # In newer CuPy versions, the method is 'standard_normal' not 'normal'
-            try:
-                # Try newer API first
-                return self.rng.standard_normal(size=length, dtype=cp.float32)
-            except AttributeError:
-                # Fall back to older API if needed
-                return self.rng.normal(0, 1, length, dtype=cp.float32)
-        else:
-            # CPU implementation
-            return self.rng.normal(0, 1, length).astype(np.float32)
+            self.start_streaming()
     
-    def generate_pink_noise(self, white_noise: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
-        """Transform white noise into pink noise"""
-        if self.config.use_gpu and HAS_CUPY:
-            # GPU implementation - FFT convolution with optimized plan reuse
-            # Use oaconvolve which has better plan caching than fftconvolve
-            return cupyx.scipy.signal.oaconvolve(white_noise, self.pink_fir, mode='same')
-        else:
-            # IMPROVED: Voss-McCartney algorithm (12-stage filter) for flatter response
-            # This implementation reduces the frequency tilt compared to the Paul Kellett algorithm
-            pink = np.zeros_like(white_noise)
-            for i in range(len(white_noise)):
-                # Get white noise value
-                white = white_noise[i]
-                
-                # Update octaves
-                total = 0.0
-                counter = 0
-                
-                # Determine which octaves to update
-                for j in range(self.pink_octaves):
-                    if counter & (1 << j) == 0:
-                        self.pink_state[j] = self.rng.normal(0, 1)
-                    total += self.pink_state[j]
-                    counter += 1
-                
-                # Average the octaves and scale
-                avg = total / self.pink_octaves
-                
-                # Apply smoothing between samples for better low-frequency response
-                pink[i] = 0.8 * avg + 0.2 * self.pink_last_value + 0.15 * white
-                self.pink_last_value = pink[i]
-                
-            # Normalize
-            pink = pink / np.sqrt(np.mean(pink**2))
-            return pink
-    
-    def generate_brown_noise(self, white_noise: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
-        """Transform white noise into brown noise using leaky integrator + HPF"""
-        if self.config.use_gpu and HAS_CUPY:
-            # IMPROVED: Fully vectorized GPU implementation using cumsum
-            # Using the formula provided: cp.cumsum((1-α) * white_noise[::-1], dtype=cp.float32)[::-1] * α**cp.arange(N)
-            N = len(white_noise)
-            alpha = BROWN_LEAKY_ALPHA
-            
-            # Create vector of powers of alpha
-            alpha_powers = cp.power(alpha, cp.arange(N, dtype=cp.float32))
-            
-            # Reverse input, compute cumulative sum, then reverse again
-            reversed_input = (1.0 - alpha) * white_noise[::-1]
-            cumsum_result = cp.cumsum(reversed_input, dtype=cp.float32)
-            brown = cumsum_result[::-1] * alpha_powers
-            
-            # Apply HPF to remove DC offset using cupyx.scipy.signal.lfilter with GPU arrays
-            return cupyx.scipy.signal.lfilter(self.brown_hpf_b_gpu, self.brown_hpf_a_gpu, brown)
-        else:
-            # CPU implementation
-            xp = np
-            # Leaky integrator (vectorized)
-            brown = xp.zeros_like(white_noise)
-            brown[0] = white_noise[0]
-            # y[n] = α*y[n-1] + (1-α)*x[n]
-            for i in range(1, len(white_noise)):
-                brown[i] = BROWN_LEAKY_ALPHA * brown[i-1] + (1-BROWN_LEAKY_ALPHA) * white_noise[i]
-            
-            # Apply HPF to remove DC offset
-            return scipy.signal.lfilter(self.brown_hpf_b, self.brown_hpf_a, brown)
-    
-    def apply_color_mix(self, white: Union[np.ndarray, "cp.ndarray"], 
-                       pink: Union[np.ndarray, "cp.ndarray"], 
-                       brown: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
-        """Mix noise colors according to configuration"""
-        xp = cp if self.config.use_gpu and HAS_CUPY else np
-        
-        # Normalize each noise type
-        white = white / xp.sqrt(xp.mean(white**2))
-        pink = pink / xp.sqrt(xp.mean(pink**2))
-        brown = brown / xp.sqrt(xp.mean(brown**2))
-        
-        # Apply color mix
-        mix = (self.config.color_mix.get('white', 0.0) * white +
-               self.config.color_mix.get('pink', 0.0) * pink +
-               self.config.color_mix.get('brown', 0.0) * brown)
-        
-        # Ensure final mix is normalized to RMS = 1
-        mix = mix / xp.sqrt(xp.mean(mix**2))
-        
-        return mix
-    
-    def apply_lfo_modulation(self, audio: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
-        """Apply slow LFO gain modulation if configured"""
-        if not self.config.lfo_rate:
-            return audio
-            
-        xp = cp if self.config.use_gpu and HAS_CUPY else np
-        
-        # Generate LFO signal (sine wave)
-        t = xp.arange(len(audio)) / self.config.sample_rate
-        lfo = xp.sin(2 * xp.pi * self.config.lfo_rate * t)
-        
-        # Scale to ±2dB modulation (linear scale: 10^(±2/20) ≈ 0.8-1.25)
-        gain_mod = 1.0 + 0.2 * lfo
-        
-        return audio * gain_mod
-    
-    def calculate_lufs(self, audio: Union[np.ndarray, "cp.ndarray"], window_size_sec=1.0) -> Tuple[Union[np.ndarray, "cp.ndarray"], float]:
-        """Calculate LUFS-style loudness using a sliding window
-        
-        IMPROVED: Uses pyloudnorm library for ITU-R BS.1770-4 compliant LUFS calculation when available
-        """
-        xp = cp if self.config.use_gpu and HAS_CUPY else np
-        
-        # If pyloudnorm is available, use it for true ITU-R BS.1770-4 LUFS calculation
-        if HAS_PYLOUDNORM:
-            # We need to move data to CPU if it's on GPU
-            if self.config.use_gpu and HAS_CUPY:
-                cpu_audio = cp.asnumpy(audio)
-            else:
-                cpu_audio = audio
-                
-            # Ensure audio is mono and 1D for pyloudnorm
-            if len(cpu_audio.shape) > 1:
-                # If multidimensional, flatten to 1D
-                cpu_audio = cpu_audio.flatten()
-            
-            try:
-                # Calculate integrated LUFS - pyloudnorm expects mono 1D array
-                integrated_lufs = self.lufs_meter.integrated_loudness(cpu_audio)
-                
-                # For momentary LUFS, use a sliding window
-                window_samples = int(window_size_sec * self.config.sample_rate)
-                hop_size = window_samples // 4  # 75% overlap
-                num_windows = max(1, (len(cpu_audio) - window_samples) // hop_size + 1)
-                
-                # Store momentary LUFS values
-                momentary_values = []
-                for i in range(num_windows):
-                    start = i * hop_size
-                    end = start + window_samples
-                    if end > len(cpu_audio):
-                        break
-                        
-                    window = cpu_audio[start:end]
-                    # Make sure window is 1D for pyloudnorm
-                    window = window.flatten()
-                    # Calculate momentary LUFS
-                    momentary = self.lufs_meter.integrated_loudness(window)
-                    momentary_values.append(momentary)
-                
-                # Return the LUFS values and integrated LUFS
-                if momentary_values:
-                    return xp.array(momentary_values), integrated_lufs
-                else:
-                    return xp.array([]), integrated_lufs
-                    
-            except Exception as e:
-                # If pyloudnorm fails, log the error and fall back to simplified calculation
-                logger.warning(f"Error in pyloudnorm calculation: {str(e)}. Falling back to simplified LUFS.")
-                # Fall through to simplified calculation
-                pass
-                
-        # Fallback to simplified LUFS approximation if pyloudnorm not available or failed
-        window_samples = int(window_size_sec * self.config.sample_rate)
-        
-        # Use overlapping windows with 75% overlap
-        hop_size = window_samples // 4
-        num_windows = max(1, (len(audio) - window_samples) // hop_size + 1)
-        
-        loudness_values = []
-        for i in range(num_windows):
-            start = i * hop_size
-            end = start + window_samples
-            if end > len(audio):
-                break
-                
-            window = audio[start:end]
-            # Mean square (simplified LUFS)
-            ms = xp.mean(window**2)
-            loudness = -0.691 + 10 * xp.log10(ms + 1e-10)
-            loudness_values.append(loudness)
-        
-        # Return the loudness values and the integrated (gated) loudness
-        if loudness_values:
-            return xp.array(loudness_values), xp.mean(xp.array(loudness_values))
-        else:
-            return xp.array([]), -100.0
-    
-    def measure_file_loudness(self, file_path: str) -> Tuple[float, float]:
-        """Measure the integrated LUFS and peak level of an entire audio file
-        
-        Args:
-            file_path: Path to the audio file
-            
-        Returns:
-            Tuple of (integrated_lufs, peak_db)
-        """
-        logger.info(f"Measuring LUFS loudness of {file_path}")
-        
-        # Get file info to determine measurement strategy
-        info = sf.info(file_path)
-        file_size = os.path.getsize(file_path)
-        
-        if HAS_PYLOUDNORM:
-            try:
-                # If file is small enough, read it all at once for accurate measurement
-                if file_size < MAX_FILE_SIZE_FOR_DIRECT_READ:
-                    # Read entire file
-                    audio, sr = sf.read(file_path)
-                    
-                    # Calculate true integrated LUFS
-                    integrated_lufs = self.lufs_meter.integrated_loudness(audio)
-                    
-                    # Calculate peak
-                    peak = np.max(np.abs(audio))
-                    peak_db = 20 * np.log10(peak + 1e-10)
-                    
-                    logger.info(f"Measured integrated LUFS: {integrated_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
-                    return integrated_lufs, peak_db
-                
-                # For larger files, use block-based measurement with buffering
-                meter = pyln.Meter(info.samplerate)
-                blocks = []  # Buffer for K-weighted blocks
-                max_peak = 0.0
-                
-                # Process in blocks of 1-10 seconds
-                seconds_per_block = min(10, max(1, self.config.duration / 20))  # Max 20 blocks
-                block_size = int(seconds_per_block * info.samplerate)
-                
-                with sf.SoundFile(file_path, 'r') as f:
-                    while True:
-                        block = f.read(block_size)
-                        if len(block) == 0:
-                            break
-                        
-                        # Update peak
-                        block_peak = np.max(np.abs(block))
-                        max_peak = max(max_peak, block_peak)
-                        
-                        # Save block for combined measurement
-                        blocks.append(block)
-                
-                # Combine blocks for integrated measurement
-                if blocks:
-                    combined = np.concatenate(blocks)
-                    integrated_lufs = meter.integrated_loudness(combined)
-                else:
-                    integrated_lufs = -100.0
-                
-                # Calculate peak in dB
-                peak_db = 20 * np.log10(max_peak + 1e-10)
-                
-                logger.info(f"Measured integrated LUFS: {integrated_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
-                return integrated_lufs, peak_db
-                
-            except Exception as e:
-                logger.warning(f"Error in pyloudnorm file measurement: {str(e)}. Falling back to RMS.")
-                # Fall through to simplified RMS-based measurement
-        
-        # Fallback to RMS-based measurement
-        logger.info("Using simplified RMS-based loudness measurement")
-        with sf.SoundFile(file_path, 'r') as f:
-            # Process in chunks of ~5 seconds
-            chunk_size = f.samplerate * 5
-            
-            # Initialize RMS and peak tracking
-            rms_sum = 0.0
-            sample_count = 0
-            peak = 0.0
-            
-            # Process file in chunks
-            while True:
-                chunk = f.read(chunk_size)
-                if len(chunk) == 0:
-                    break
-                    
-                # Update RMS sum
-                rms_sum += np.sum(chunk**2)
-                sample_count += len(chunk)
-                
-                # Update peak
-                chunk_peak = np.max(np.abs(chunk))
-                peak = max(peak, chunk_peak)
-            
-            # Calculate final RMS and convert to LUFS-like scale
-            if sample_count > 0:
-                rms = np.sqrt(rms_sum / sample_count)
-                # Approximate LUFS from RMS (-0.691 is an offset to roughly align with LUFS)
-                pseudo_lufs = -0.691 + 10 * np.log10(rms**2 + 1e-10)
-            else:
-                pseudo_lufs = -100.0
-            
-            # Calculate peak in dB
-            peak_db = 20 * np.log10(peak + 1e-10)
-            
-        logger.info(f"Measured approximate LUFS: {pseudo_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
-        return pseudo_lufs, peak_db
-    
-    def measure_file_rms(self, file_path: str) -> float:
-        """Measure RMS of an audio file in dBFS
-        
-        Args:
-            file_path: Path to the audio file
-            
-        Returns:
-            RMS level in dBFS
-        """
-        logger.info(f"Measuring RMS of {file_path}")
-        
-        # Get file info to determine measurement strategy
-        info = sf.info(file_path)
-        file_size = os.path.getsize(file_path)
-        
-        # For small files, read all at once
-        if file_size < MAX_FILE_SIZE_FOR_DIRECT_READ:
-            # Read entire file
-            audio, sr = sf.read(file_path)
-            
-            # Calculate RMS
-            rms = np.sqrt(np.mean(audio**2))
-            rms_db = 20 * np.log10(rms + 1e-10)
-            
-            logger.info(f"Measured file RMS: {rms_db:.1f} dBFS")
-            return rms_db
-        
-        # For larger files, calculate in chunks
-        with sf.SoundFile(file_path, 'r') as f:
-            chunk_size = f.samplerate * 5  # 5-second chunks
-            sum_sq = 0.0
-            samples = 0
-            
-            while True:
-                chunk = f.read(chunk_size)
-                if len(chunk) == 0:
-                    break
-                sum_sq += np.sum(chunk**2)
-                samples += len(chunk)
-        
-        # Calculate overall RMS
-        if samples > 0:
-            rms = np.sqrt(sum_sq / samples)
-            rms_db = 20 * np.log10(rms + 1e-10)
-        else:
-            rms_db = -100.0
-            
-        logger.info(f"Measured file RMS: {rms_db:.1f} dBFS")
-        return rms_db
-    
-    def generate_raw_buffer(self) -> np.ndarray:
-        """Generate a buffer of raw noise (mixed but without final gain/limiting)"""
-        # Generate white noise
-        white = self.generate_white_noise(self.buffer_samples)
-        
-        # Generate pink and brown from white
-        pink = self.generate_pink_noise(white)
-        brown = self.generate_brown_noise(white)
-        
-        # Mix colors
-        audio = self.apply_color_mix(white, pink, brown)
-        
-        # Apply LFO modulation if configured
-        if self.config.lfo_rate:
-            audio = self.apply_lfo_modulation(audio)
-            
-        # Move to CPU if on GPU
-        if self.config.use_gpu and HAS_CUPY:
-            audio = cp.asnumpy(audio)
-            
-        return audio
-    
-    def _generate_raw_file(self, output_path: str) -> None:
-        """Generate raw noise file without final gain control (first pass)"""
-        # Store original buffer size 
-        orig_buffer_samples = self.buffer_samples
-        samples_written = 0
-        last_logged_percent = -10
-        
-        # Create output file for FLOAT samples (no dither needed)
-        with sf.SoundFile(output_path, mode='w', samplerate=self.config.sample_rate, 
-                        channels=1, subtype='FLOAT') as f:
-            
-            # Generate and write buffers
-            for i in range(self.num_buffers):
-                remaining = self.total_samples - samples_written
-                actual_buffer_samples = min(orig_buffer_samples, remaining)
-                
-                # Temporarily adjust buffer size for this iteration only
-                self.buffer_samples = actual_buffer_samples
-                
-                # Generate raw buffer
-                buffer = self.generate_raw_buffer()
-                
-                # Write to file
-                f.write(buffer)
-                samples_written += len(buffer)
-                
-                # Log progress in 10% increments
-                progress = samples_written / self.total_samples * 100
-                if progress - last_logged_percent >= 10 or progress >= 100:
-                    logger.info(f"Pass 1 progress: {progress:.1f}%")
-                    last_logged_percent = progress
-        
-        # Restore original buffer size
-        self.buffer_samples = orig_buffer_samples
-    
-    def generate_to_file(self, output_path: str) -> Dict:
-        """Generate noise and write to file using two-pass approach for better loudness control"""
-        logger.info(f"Generating {self.config.duration:.1f}s of noise to {output_path}")
-        logger.info(f"Using {'GPU' if self.config.use_gpu and HAS_CUPY else 'CPU'} backend")
-        logger.info(f"Seed: {self.config.seed}")
-        logger.info(f"Color mix: {self.config.color_mix}")
-        
-        start_time = time.time()
-        
-        # Determine output format from file extension
-        _, ext = os.path.splitext(output_path)
-        output_format = "PCM_16" if ext.lower() == ".wav" else "FLAC" if ext.lower() == ".flac" else "PCM_16"
-        
-        # Use context manager for temp file to ensure cleanup
-        with temp_wav_file() as temp_path:
-            # PASS 1: Generate raw audio and measure
-            logger.info("Pass 1: Generating raw audio without normalization...")
-            self._generate_raw_file(temp_path)
-            
-            # Measure the raw file's RMS, LUFS and peak
-            raw_rms_db = self.measure_file_rms(temp_path)
-            integrated_lufs, peak_db = self.measure_file_loudness(temp_path)
-            logger.info(f"Raw audio measurements - RMS: {raw_rms_db:.1f} dBFS, LUFS: {integrated_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
-            
-            # PASS 2: Compute gain and normalize
-            logger.info("Pass 2: Computing gain and normalizing...")
-            
-            # Step 1: Compute base gain from RMS target
-            target_rms_db = self.config.rms_target
-            gain_db = target_rms_db - raw_rms_db
-            logger.info(f"Base RMS gain: {gain_db:.1f} dB (Target: {target_rms_db:.1f} dBFS)")
-            
-            # Step 2: Predict resulting LUFS after RMS gain
-            predicted_lufs = integrated_lufs + gain_db
-            logger.info(f"Predicted LUFS after gain: {predicted_lufs:.1f}")
-            
-            # Step 3: Apply safety threshold if needed
-            if predicted_lufs > SAFETY_LUFS_THRESHOLD:
-                safety_gain_db = SAFETY_LUFS_THRESHOLD - predicted_lufs
-                gain_db += safety_gain_db
-                logger.warning(
-                    f"Predicted LUFS {predicted_lufs:.1f} exceeds safety threshold {SAFETY_LUFS_THRESHOLD:.1f}. "
-                    f"Applying additional {safety_gain_db:.1f} dB reduction."
-                )
-            
-            # Step 4: Check peak levels after gain
-            predicted_peak_db = peak_db + gain_db
-            if predicted_peak_db > self.config.peak_ceiling:
-                limiting_gain_db = self.config.peak_ceiling - predicted_peak_db
-                gain_db += limiting_gain_db
-                logger.info(
-                    f"Predicted peak {predicted_peak_db:.1f} dBFS exceeds ceiling {self.config.peak_ceiling:.1f} dBFS. "
-                    f"Applying {limiting_gain_db:.1f} dB limiting."
-                )
-            
-            # Apply the calculated gain to the raw file
-            logger.info(f"Processing with total gain of {gain_db:.1f} dB")
-            process_audio_file(temp_path, output_path, gain_db, self.config.peak_ceiling, output_format)
-        
-        # Calculate total processing time
-        elapsed = time.time() - start_time
-        logger.info(f"Generated {self.config.duration:.1f}s of noise in {elapsed:.1f}s")
-        
-        # Return metrics
-        return {
-            "raw_rms_db": raw_rms_db,
-            "integrated_lufs": integrated_lufs,
-            "peak_db": peak_db,
-            "applied_gain_db": gain_db,
-            "output_path": output_path,
-            "processing_time": elapsed
-        }
-    
-    def apply_loudness_control(self, audio: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
-        """Apply RMS target and peak ceiling with LUFS-based safety control - for streaming use"""
-        xp = cp if self.config.use_gpu and HAS_CUPY else np
-        
-        # Calculate LUFS and RMS
-        loudness_values, integrated_lufs = self.calculate_lufs(audio, window_size_sec=1.0)
-        current_rms = xp.sqrt(xp.mean(audio**2))
-        current_rms_db = 20 * xp.log10(current_rms + 1e-10)
-        
-        # Step 1: Calculate gain needed to reach target RMS
-        target_rms_db = self.config.rms_target
-        gain_db = target_rms_db - current_rms_db
-        
-        # Step 2: Predict resulting LUFS after RMS gain
-        predicted_lufs = integrated_lufs + gain_db
-        
-        # Step 3: Apply safety gain reduction if predicted LUFS exceeds threshold
-        if predicted_lufs > SAFETY_LUFS_THRESHOLD:
-            safety_gain_db = SAFETY_LUFS_THRESHOLD - predicted_lufs
-            gain_db += safety_gain_db
-            logger.warning(
-                f"Predicted LUFS {predicted_lufs:.1f} exceeds safety threshold {SAFETY_LUFS_THRESHOLD:.1f}. "
-                f"Applying additional {safety_gain_db:.1f} dB reduction."
-            )
-        
-        # Apply gain
-        gain_linear = 10 ** (gain_db / 20)
-        audio = audio * gain_linear
-        
-        # Check for peaks exceeding ceiling
-        peak = xp.max(xp.abs(audio))
-        peak_db = 20 * xp.log10(peak + 1e-10)
-        
-        # Apply limiting if needed
-        if peak_db > self.config.peak_ceiling:
-            limiting_gain = 10 ** ((self.config.peak_ceiling - peak_db) / 20)
-            audio = audio * limiting_gain
-            logger.info(f"Applied limiting: {limiting_gain:.3f} ({peak_db:.1f} dBFS -> {self.config.peak_ceiling:.1f} dBFS)")
-        
-        return audio
-    
-    def apply_dither(self, audio: Union[np.ndarray, "cp.ndarray"], output_format: str = "PCM_16") -> np.ndarray:
-        """Apply TPDF dither for bit-depth-reduced output formats
-        
-        Args:
-            audio: Input audio array (CPU or GPU)
-            output_format: Output format (e.g., "PCM_16" for 16-bit PCM)
-            
-        Returns:
-            Dithered audio array on CPU
-        """
-        # Skip dither for formats that don't need it (FLAC, FLOAT)
-        if output_format not in ["PCM_16", "PCM_24"]:
-            # Just move to CPU if needed, no dither required
-            if self.config.use_gpu and HAS_CUPY:
-                return cp.asnumpy(audio)
-            else:
-                return audio
-            
-        # For PCM formats, apply TPDF dither
-        if self.config.use_gpu and HAS_CUPY:
-            # Move to CPU first
-            audio_cpu = cp.asnumpy(audio)
-            
-            # Generate and apply dither on CPU to avoid extra GPU->CPU transfer
-            bits = 16 if output_format == "PCM_16" else 24
-            amplitude = 2.0 / (2**bits - 1)
-            dither = np.random.uniform(-amplitude, amplitude, len(audio_cpu)) - \
-                     np.random.uniform(-amplitude, amplitude, len(audio_cpu))
-            return audio_cpu + dither
-        else:
-            # CPU path remains unchanged
-            xp = np
-            bits = 16 if output_format == "PCM_16" else 24
-            amplitude = 2.0 / (2**bits - 1)
-            dither = xp.random.uniform(-amplitude, amplitude, len(audio)) - \
-                     xp.random.uniform(-amplitude, amplitude, len(audio))
-            return audio + dither
-    
-    def generate_buffer(self, output_format: str = "PCM_16") -> Tuple[np.ndarray, Dict]:
-        """Generate a buffer of noise according to configuration - for streaming use"""
-        # Generate white noise
-        white = self.generate_white_noise(self.buffer_samples)
-        
-        # Generate pink and brown from white
-        pink = self.generate_pink_noise(white)
-        brown = self.generate_brown_noise(white)
-        
-        # Mix colors
-        audio = self.apply_color_mix(white, pink, brown)
-        
-        # Apply LFO modulation if configured
-        if self.config.lfo_rate:
-            audio = self.apply_lfo_modulation(audio)
-        
-        # Apply loudness control
-        audio = self.apply_loudness_control(audio)
-        
-        # Apply dither and move to CPU if needed
-        audio = self.apply_dither(audio, output_format)
-        
-        # Calculate metrics
-        metrics = {
-            "rms_db": 20 * np.log10(np.sqrt(np.mean(audio**2)) + 1e-10),
-            "peak_db": 20 * np.log10(np.max(np.abs(audio)) + 1e-10)
-        }
-        
-        return audio, metrics
-
-
-class StreamingNoiseGenerator(NoiseGenerator):
-    """Real-time streaming version of the noise generator"""
-    
-    def __init__(self, config: NoiseConfig):
-        # Force CPU mode for streaming
-        config.use_gpu = False
-        super().__init__(config)
-        
-        # State variables for streaming
-        self.pink_state = np.zeros(self.pink_octaves)  # Using improved Voss-McCartney
-        self.pink_last_value = 0.0
-        self.brown_prev = 0.0
-        
-        # For streaming, we pre-calculate color-specific loudness adjustments
-        # to ensure consistent perceived loudness between colors
-        white_ratio = config.color_mix.get('white', 0.0)
-        
-        # Apply loudness calibration based on color mix
-        # White noise is perceptually much louder at the same RMS
-        if white_ratio > 0.8:
-            # For mostly white noise, adjust RMS target to account for perceptual loudness
-            self.adjusted_rms_target = config.rms_target - 15 * (white_ratio - 0.8)
-            logger.info(f"Streaming adjusted RMS target to {self.adjusted_rms_target:.1f} dBFS for {white_ratio:.1f} white noise")
-        else:
-            self.adjusted_rms_target = config.rms_target
-    
-    def get_next_chunk(self, chunk_size: int = 2048) -> np.ndarray:
-        """Generate a chunk of audio for real-time streaming"""
-        # Override buffer size for streaming
-        self.buffer_samples = chunk_size
-        
-        # Generate chunk with explicit output format
-        chunk, _ = self.generate_buffer("PCM_16")
-        
-        return chunk
-
-
-def load_preset(preset_name: str, presets_file: str = None) -> Dict:
-    """Load a noise preset from YAML file"""
-    if presets_file is None:
-        # Default to bundled presets
-        presets_file = os.path.join(os.path.dirname(__file__), "presets.yaml")
-    
-    with open(presets_file, 'r') as f:
-        all_presets = yaml.safe_load(f)
-    
-    if preset_name not in all_presets.get('presets', {}):
-        logger.warning(f"Preset '{preset_name}' not found, using 'default'")
-        preset_name = 'default'
-    
-    return all_presets['presets'][preset_name]
-
-
-def auto_select_backend() -> bool:
-    """Auto-select GPU/CPU backend based on available hardware"""
-    if not HAS_CUPY:
-        logger.info("CuPy not available, using CPU backend")
-        return False
-    
-    try:
-        # Check if CUDA is available and functioning
-        n_gpus = cp.cuda.runtime.getDeviceCount()
-        if n_gpus > 0:
-            # Get device info
-            device = cp.cuda.runtime.getDeviceProperties(0)
-            logger.info(f"Found GPU: {device['name'].decode()}")
-            logger.info(f"CUDA Compute Capability: {device['major']}.{device['minor']}")
-            
-            # Verify basic CUDA functionality with a simple operation
-            try:
-                # Test if we can perform a basic operation
-                test_arr = cp.zeros(10)
-                test_arr += 1
-                cp.asnumpy(test_arr)
-                return True
-            except Exception as cuda_error:
-                logger.warning(f"CUDA test failed, falling back to CPU: {cuda_error}")
-                return False
-        else:
-            logger.info("No CUDA GPUs found, using CPU backend")
-            return False
-    except Exception as e:
-        logger.warning(f"Error checking GPU: {e}")
-        return False
-
-
-def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="Baby-Noise Generator")
-    parser.add_argument("--output", "-o", default="baby_noise.wav", help="Output file path")
-    parser.add_argument("--duration", "-d", type=float, default=DEFAULT_DURATION, 
-                       help="Duration in seconds")
-    parser.add_argument("--seed", default="auto", help="PRNG seed (auto, random, or integer)")
-    parser.add_argument("--preset", "-p", default="default", help="Preset name")
-    parser.add_argument("--presets-file", help="Custom presets YAML file")
-    parser.add_argument("--white", type=float, help="White noise ratio (0.0-1.0)")
-    parser.add_argument("--pink", type=float, help="Pink noise ratio (0.0-1.0)")
-    parser.add_argument("--brown", type=float, help="Brown noise ratio (0.0-1.0)")
-    parser.add_argument("--rms", type=float, help="RMS target in dBFS")
-    parser.add_argument("--peak", type=float, help="Peak ceiling in dBFS")
-    parser.add_argument("--lfo", type=float, help="LFO rate in Hz")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU backend")
-    parser.add_argument("--gpu", action="store_true", help="Force GPU backend")
-    parser.add_argument("--stream", action="store_true", help="Use streaming mode (CPU only)")
-    args = parser.parse_args()
-    
-    # Load preset
-    preset = load_preset(args.preset, args.presets_file)
-    
-    # Determine seed
-    if args.seed == "auto":
-        seed = int(time.time())
-    elif args.seed == "random":
-        seed = np.random.randint(0, 2**32 - 1)
-    else:
-        try:
-            seed = int(args.seed)
-        except ValueError:
-            logger.warning(f"Invalid seed '{args.seed}', using time-based seed")
+    def create_config(self):
+        """Create a configuration from current UI state"""
+        # Parse seed
+        seed_str = self.seed_var.get()
+        if seed_str == "auto":
             seed = int(time.time())
-    
-    # Determine color mix
-    color_mix = preset.get('color_mix', {'white': 0.4, 'pink': 0.4, 'brown': 0.2})
-    if args.white is not None or args.pink is not None or args.brown is not None:
+        elif seed_str == "random":
+            seed = np.random.randint(0, 2**32 - 1)
+        else:
+            try:
+                seed = int(seed_str)
+            except ValueError:
+                seed = int(time.time())
+                self.seed_var.set(str(seed))
+        
+        # Get color mix
         color_mix = {
-            'white': args.white if args.white is not None else color_mix.get('white', 0.0),
-            'pink': args.pink if args.pink is not None else color_mix.get('pink', 0.0),
-            'brown': args.brown if args.brown is not None else color_mix.get('brown', 0.0)
+            'white': self.white_var.get(),
+            'pink': self.pink_var.get(),
+            'brown': self.brown_var.get()
         }
+        
         # Normalize to sum to 1.0
         total = sum(color_mix.values())
         if total > 0:
             color_mix = {k: v / total for k, v in color_mix.items()}
+        else:
+            color_mix = {'white': 0.4, 'pink': 0.4, 'brown': 0.2}
+        
+        # Get LFO rate if enabled
+        lfo_rate = self.lfo_var.get() if self.lfo_enabled_var.get() else None
+        
+        # Determine output format and settings
+        format_str = self.output_format_var.get()
+        if format_str == "WAV (16-bit)":
+            output_format = "PCM_16"
+        elif format_str == "WAV (24-bit)":
+            output_format = "PCM_24"
+        else:  # FLAC
+            output_format = "FLAC"
+        
+        # Determine peak ceiling based on profile
+        profile = self.profile_var.get()
+        profile_settings = NOISE_PROFILES.get(profile, NOISE_PROFILES["baby-safe"])
+        peak_ceiling = profile_settings.get("peak_ceiling", -3.0)
+        
+        # Create config
+        config = NoiseConfig(
+            seed=seed,
+            duration=self.duration_var.get(),
+            color_mix=color_mix,
+            rms_target=self.rms_var.get(),
+            peak_ceiling=peak_ceiling,
+            lfo_rate=lfo_rate,
+            sample_rate=SAMPLE_RATE,
+            use_gpu=auto_select_backend(),
+            channels=self.channels_var.get(),
+            profile=profile
+        )
+        
+        return config, output_format
     
-    # Other parameters
-    rms_target = args.rms if args.rms is not None else preset.get('rms_target', DEFAULT_RMS_TARGET)
-    peak_ceiling = args.peak if args.peak is not None else DEFAULT_PEAK_CEILING
-    lfo_rate = args.lfo if args.lfo is not None else preset.get('lfo_rate')
+    def update_progress(self, progress_percentage):
+        """Update the progress bar during rendering"""
+        self.progress_var.set(progress_percentage)
+        self.root.update_idletasks()
     
-    # Determine backend
-    if args.stream:
-        use_gpu = False
-    elif args.cpu:
-        use_gpu = False
-    elif args.gpu:
-        use_gpu = True
-    else:
-        use_gpu = auto_select_backend()
-    
-    # Create config
-    config = NoiseConfig(
-        seed=seed,
-        duration=args.duration,
-        color_mix=color_mix,
-        rms_target=rms_target,
-        peak_ceiling=peak_ceiling,
-        lfo_rate=lfo_rate,
-        use_gpu=use_gpu
-    )
-    
-    # Create generator
-    if args.stream:
-        generator = StreamingNoiseGenerator(config)
-        # This would be integrated into an audio streaming framework in a real app
-        # For demonstration, just show it can generate chunks
-        chunk = generator.get_next_chunk()
-        logger.info(f"Generated streaming chunk, shape: {chunk.shape}")
-    else:
+    def render_to_file(self):
+        """Render noise to a file"""
+        if self.streaming:
+            messagebox.showwarning("Cannot Render", "Please stop playback before rendering.")
+            return
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
+        
+        # Get output format
+        format_str = self.output_format_var.get()
+        if format_str == "WAV (16-bit)" or format_str == "WAV (24-bit)":
+            extension = ".wav"
+        else:  # FLAC
+            extension = ".flac"
+        
+        # Get bitrate info for filename
+        bitrate = "16bit" if format_str == "WAV (16-bit)" else "24bit"
+        
+        # Channel info for filename
+        channels = "mono" if self.channels_var.get() == 1 else "stereo"
+        
+        # Default filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"baby_noise_{channels}_{bitrate}_{timestamp}{extension}"
+        default_path = os.path.join(DEFAULT_OUTPUT_DIR, default_filename)
+        
+        # Ask for output path
+        output_path = filedialog.asksaveasfilename(
+            initialdir=DEFAULT_OUTPUT_DIR,
+            initialfile=default_filename,
+            defaultextension=extension,
+            filetypes=[
+                ("WAV files", "*.wav"), 
+                ("FLAC files", "*.flac"), 
+                ("All files", "*.*")
+            ]
+        )
+        
+        if not output_path:
+            return
+        
+        # Create config
+        config, output_format = self.create_config()
+        
+        # Update status and disable render button
+        self.status_var.set(f"Rendering to {os.path.basename(output_path)}...")
+        self.render_button.configure(state=tk.DISABLED)
+        self.progress_var.set(0)
+        self.root.update()
+        
+        # Create generator
         generator = NoiseGenerator(config)
-        # Generate to file
-        generator.generate_to_file(args.output)
+        
+        # Start rendering in a separate thread
+        threading.Thread(
+            target=self._render_thread,
+            args=(generator, output_path, output_format),
+            daemon=True
+        ).start()
+    
+    def _render_thread(self, generator, output_path, output_format):
+        """Background thread for rendering"""
+        try:
+            # Get file extension
+            _, ext = os.path.splitext(output_path)
+            
+            # Update status (on main thread) with correct extension
+            self.root.after(0, lambda: self.status_var.set(f"Rendering to {os.path.basename(output_path)}..."))
+            
+            # Generate to file
+            result = generator.generate_to_file(output_path)
+            
+            # Update UI from main thread
+            self.root.after(0, lambda: self._render_complete(output_path, result))
+        except Exception as e:
+            logger.error(f"Error rendering: {e}")
+            self.root.after(0, lambda: self._render_error(str(e)))
+    
+    def _render_complete(self, output_path, result=None):
+        """Called when rendering is complete"""
+        self.render_button.configure(state=tk.NORMAL)
+        
+        if result:
+            self.status_var.set(
+                f"Rendered to {os.path.basename(output_path)} "
+                f"({result['integrated_lufs']:.1f} LUFS, {result['peak_db']:.1f} dBFS peak)"
+            )
+        else:
+            self.status_var.set(f"Rendered to {os.path.basename(output_path)}")
+        
+        # Ask if user wants to open the directory
+        if messagebox.askyesno("Render Complete", 
+                              f"Noise file saved to {output_path}\n\nOpen containing folder?"):
+            self._open_directory(os.path.dirname(output_path))
+    
+    def _render_error(self, error_message):
+        """Called when rendering fails"""
+        self.render_button.configure(state=tk.NORMAL)
+        self.status_var.set(f"Error: {error_message}")
+        messagebox.showerror("Render Error", f"Failed to render noise: {error_message}")
+    
+    def _open_directory(self, path):
+        """Open directory in file explorer"""
+        if sys.platform == 'win32':
+            os.startfile(path)
+        elif sys.platform == 'darwin':
+            os.system(f'open "{path}"')
+        else:
+            os.system(f'xdg-open "{path}"')
+    
+    def on_rms_change(self, event=None):
+        """Handle RMS slider change"""
+        # Get profile safety threshold
+        profile = NOISE_PROFILES.get(self.profile_var.get(), NOISE_PROFILES["baby-safe"])
+        safety_threshold_lufs = profile.get("lufs_threshold", -27.0)
+        
+        # Convert LUFS threshold to approximate RMS for UI warning
+        # Simple approximation: RMS ~= LUFS - 3dB for typical noise
+        safety_threshold_rms = safety_threshold_lufs - 3.0 if safety_threshold_lufs > -60 else -60.0
+        
+        # Check if current RMS exceeds safety threshold for baby-safe profile
+        if self.profile_var.get() == "baby-safe" and self.rms_var.get() > safety_threshold_rms:
+            # Highlight the slider in red to indicate warning
+            self.rms_label.configure(foreground="red")
+            # Show warning if significantly over threshold
+            if self.rms_var.get() > safety_threshold_rms + 2.0:
+                messagebox.showwarning(
+                    "High Volume Warning", 
+                    f"The selected RMS level of {self.rms_var.get():.1f} dBFS exceeds the "
+                    f"AAP recommended level of {safety_threshold_rms:.1f} dBFS (50 dB SPL) "
+                    f"for infant hearing safety."
+                )
+        else:
+            # Reset to normal color
+            self.rms_label.configure(foreground="")
+        
+        # Update visualization
+        self.update_visualization()
+    
+    def randomize_seed(self):
+        """Generate a random seed"""
+        seed = np.random.randint(0, 2**32 - 1)
+        self.seed_var.set(str(seed))
+    
+    def update_visualization(self):
+        """Update the visualization plots"""
+        # Update spectral lines
+        x = np.logspace(np.log10(20), np.log10(20000), 100)
+        
+        # White noise (flat)
+        white_y = np.zeros_like(x) - 3.0
+        
+        # Pink noise (-3 dB/octave)
+        pink_y = -10 * np.log10(x / 20) - 3.0
+        
+        # Brown noise (-5.8 dB/octave to match BROWN_LEAKY_ALPHA=0.999)
+        # Factor (1-α) gives ~-5.8 dB/oct instead of -6 dB/oct
+        brown_y = -20 * np.log10(x / 20) * (1-0.999) / (1-0.995) - 3.0
+        
+        # Apply high-pass for brown
+        brown_y[x < 20] = -30
+        
+        # Mix according to color mix
+        total = self.white_var.get() + self.pink_var.get() + self.brown_var.get()
+        if total > 0:
+            mix_y = (self.white_var.get() * np.power(10, white_y/10) + 
+                    self.pink_var.get() * np.power(10, pink_y/10) + 
+                    self.brown_var.get() * np.power(10, brown_y/10)) / total
+            mix_y = 10 * np.log10(mix_y)
+        else:
+            mix_y = white_y
+        
+        # Update lines
+        self.white_line.set_ydata(white_y)
+        self.pink_line.set_ydata(pink_y)
+        self.brown_line.set_ydata(brown_y)
+        self.mix_line.set_ydata(mix_y)
+        
+        # Update target level in level meter
+        x_range = np.linspace(0, 10, 100)
+        self.target_line.set_data(x_range, np.ones_like(x_range) * self.rms_var.get())
+        
+        # Update safety threshold line based on profile
+        profile = NOISE_PROFILES.get(self.profile_var.get(), NOISE_PROFILES["baby-safe"])
+        if self.profile_var.get() == "baby-safe":
+            safety_threshold = -60.0  # AAP recommended max (approx)
+        else:
+            # For youtube-pub, use a more relaxed threshold
+            safety_threshold = -30.0  # Just a visual reference point
+        
+        self.safety_line.set_data(x_range, np.ones_like(x_range) * safety_threshold)
+        
+        # Redraw canvas
+        self.canvas.draw()
+    
+    def update_ui(self):
+        """Update UI elements (called periodically)"""
+        # Update RMS display
+        if self.streaming:
+            self.rms_label.configure(text=f"Current: {self.current_rms:.1f} dB")
+            
+            # Update label color based on safety threshold
+            profile = NOISE_PROFILES.get(self.profile_var.get(), NOISE_PROFILES["baby-safe"])
+            if self.profile_var.get() == "baby-safe" and self.current_rms > -60.0:
+                self.rms_label.configure(foreground="red")
+            else:
+                self.rms_label.configure(foreground="")
+            
+            # Update level meter
+            if self.rms_history:
+                x = np.linspace(0, 10, len(self.rms_history))
+                self.level_line.set_data(x, self.rms_history)
+                self.level_ax.set_xlim(0, 10)
+                self.canvas.draw()
+        
+        # Schedule next update
+        self.root.after(UPDATE_INTERVAL, self.update_ui)
+        
+    def load_preset(self, preset_name):
+        """Load a preset from the presets dictionary"""
+        if preset_name not in self.presets:
+            preset_name = "default"
+        
+        preset = self.presets[preset_name]
+        
+        # Update UI variables
+        color_mix = preset.get('color_mix', {'white': 0.4, 'pink': 0.4, 'brown': 0.2})
+        self.white_var.set(color_mix.get('white', 0.4))
+        self.pink_var.set(color_mix.get('pink', 0.4))
+        self.brown_var.set(color_mix.get('brown', 0.2))
+        
+        # Update warmth slider based on mix
+        # Calculate warmth value (0-100) from color mix
+        white_ratio = color_mix.get('white', 0.0)
+        pink_ratio = color_mix.get('pink', 0.0)
+        brown_ratio = color_mix.get('brown', 0.0)
+        
+        # Simple warmth calculation:
+        # 0 = all white, 50 = equal white/pink, 100 = all brown
+        warmth = 0
+        if white_ratio < 0.01 and brown_ratio > 0.99:
+            warmth = 100  # All brown
+        elif white_ratio > 0.99 and brown_ratio < 0.01:
+            warmth = 0    # All white
+        else:
+            # Weighted calculation
+            warmth = int((0.2 * pink_ratio + 0.8 * brown_ratio) * 100)
+        
+        self.warmth_var.set(warmth)
+        self.warmth_label.configure(text=f"{warmth}%")
+        
+        # Other parameters
+        self.rms_var.set(preset.get('rms_target', -63.0))
+        
+        # Get current profile safety threshold
+        profile = NOISE_PROFILES.get(self.profile_var.get(), NOISE_PROFILES["baby-safe"])
+        safety_threshold_lufs = profile.get("lufs_threshold", -27.0)
+        safety_threshold_rms = safety_threshold_lufs - 3.0 if safety_threshold_lufs > -60 else -60.0
+        
+        # Check if RMS exceeds safety threshold and warn for baby-safe profile
+        if self.profile_var.get() == "baby-safe" and self.rms_var.get() > safety_threshold_rms:
+            self.rms_label.configure(foreground="red")
+            messagebox.showwarning(
+                "High Volume Preset", 
+                f"The selected preset '{preset_name}' has an RMS level of {self.rms_var.get():.1f} dBFS, "
+                f"which exceeds the AAP recommended level of {safety_threshold_rms:.1f} dBFS (50 dB SPL) "
+                f"for infant hearing safety."
+            )
+        else:
+            self.rms_label.configure(foreground="")
+        
+        lfo_rate = preset.get('lfo_rate')
+        if lfo_rate is not None:
+            self.lfo_var.set(lfo_rate)
+            self.lfo_enabled_var.set(True)
+        else:
+            self.lfo_enabled_var.set(False)
+        
+        # Update visualization
+        self.update_visualization()
+    
+    def on_preset_change(self, event=None):
+        """Handle preset selection change"""
+        self.load_preset(self.preset_var.get())
+    
+    def on_profile_change(self, event=None):
+        """Handle profile selection change"""
+        profile = self.profile_var.get()
+        profile_settings = NOISE_PROFILES.get(profile, NOISE_PROFILES["baby-safe"])
+        
+        # Update profile info text
+        self.profile_info.configure(text=profile_settings.get("description", ""))
+        
+        # Adjust RMS target based on profile
+        if profile == "baby-safe":
+            # Set baby-safe default level
+            if self.rms_var.get() > -60.0:  # If current level is unsafe
+                self.rms_var.set(-63.0)  # Set to default safe level
+        else:  # youtube-pub
+            # Set YouTube-appropriate levels
+            if self.rms_var.get() < -30.0:  # If current level is too quiet for YouTube
+                self.rms_var.set(-20.0)  # ~-16 LUFS for YouTube
+        
+        # Update visualization (including safety thresholds)
+        self.update_visualization()
+    
+    def on_warmth_change(self, event=None):
+        """Handle warmth slider change"""
+        # Update percentage label
+        warmth = int(self.warmth_var.get())
+        self.warmth_label.configure(text=f"{warmth}%")
+        
+        # Map 0-100 warmth to color mix using improved mapping
+        warmth_frac = warmth / 100.0  # Convert to 0.0-1.0 range
+        
+        if warmth_frac < 0.33:
+            # 0-33%: Mostly white to equal white/pink
+            t = warmth_frac * 3  # 0-1
+            white = 1.0 - 0.5 * t
+            pink = 0.5 * t
+            brown = 0.0
+        elif warmth_frac < 0.67:
+            # 33-67%: Equal white/pink to equal pink/brown
+            t = (warmth_frac - 0.33) * 3  # 0-1
+            white = 0.5 - 0.5 * t
+            pink = 0.5
+            brown = 0.0 + 0.5 * t
+        else:
+            # 67-100%: Equal pink/brown to mostly brown
+            t = (warmth_frac - 0.67) * 3  # 0-1
+            white = 0.0
+            pink = 0.5 - 0.4 * t
+            brown = 0.5 + 0.4 * t
+        
+        # Update sliders without triggering their callbacks
+        self.white_var.set(white)
+        self.pink_var.set(pink)
+        self.brown_var.set(brown)
+        
+        # Update visualization
+        self.update_visualization()
+    
+    def on_color_change(self, event=None):
+        """Handle manual color sliders change"""
+        # Calculate warmth based on color mix
+        white_ratio = self.white_var.get()
+        pink_ratio = self.pink_var.get()
+        brown_ratio = self.brown_var.get()
+        
+        # Normalize to sum to 1.0
+        total = white_ratio + pink_ratio + brown_ratio
+        
+        if total > 0:
+            # Normalize ratios
+            white_ratio /= total
+            pink_ratio /= total
+            brown_ratio /= total
+            
+            # Calculate warmth (0-100)
+            if white_ratio > 0.99 and brown_ratio < 0.01:
+                warmth = 0  # All white
+            elif white_ratio < 0.01 and brown_ratio > 0.99:
+                warmth = 100  # All brown
+            else:
+                warmth = int((0.2 * pink_ratio + 0.8 * brown_ratio) * 100)
+                
+            # Update warmth slider and label without triggering callback
+            self.warmth_var.set(warmth)
+            self.warmth_label.configure(text=f"{warmth}%")
+        
+        # Update visualization
+        self.update_visualization()
+
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description="Baby-Noise Generator GUI")
+    parser.add_argument("--profile", choices=["baby-safe", "youtube-pub"], default="baby-safe",
+                       help="Default output profile")
+    args = parser.parse_args()
+    
+    # Create output directory
+    os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
+    
+    # Create the root window
+    root = tk.Tk()
+    
+    # Create the app
+    app = BabyNoiseApp(root)
+    
+    # Set default profile from command line
+    app.profile_var.set(args.profile)
+    app.on_profile_change()
+    
+    # Start the main loop
+    root.mainloop()
 
 
 if __name__ == "__main__":
