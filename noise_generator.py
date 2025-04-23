@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Baby-Noise Generator App v1.2
-# GUI application for the Baby-Noise Generator
+# Baby-Noise Generator App v1.2 - GPU Optimized
+# Exclusively optimized for GPU acceleration with no CPU fallback
 
 import os
 import sys
@@ -21,12 +21,28 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 import soundfile as sf
 
-# Import our noise generator module
-from noise_generator import (
-    NoiseConfig, StreamingNoiseGenerator, NoiseGenerator, 
-    load_preset, auto_select_backend, SAMPLE_RATE,
-    NOISE_PROFILES, generate_stereo_noise, measure_true_peak
-)
+# Import CuPy - required for this GPU-only version
+try:
+    import cupy as cp
+    from cupyx.scipy import signal as cusignal
+    from cupyx.scipy import fft as cufft
+except ImportError:
+    raise ImportError(
+        "CuPy is required for this GPU-only version. "
+        "Install with: pip install cupy-cuda12x"
+    )
+
+# Constants
+SAMPLE_RATE = 44100
+DEFAULT_PEAK_CEILING = -3.0  # dBFS
+BROWN_LEAKY_ALPHA = 0.999    # Leaky integrator coefficient
+FFT_BLOCK_SIZE = 2**18       # ~1.5 seconds at 44.1 kHz (large block optimization)
+BLOCK_OVERLAP = 4096         # For smooth transitions between blocks
+STREAM_BUFFER_SIZE = 65536   # Increased buffer size for GPU efficiency
+APP_TITLE = "Baby-Noise Generator v1.2 - GPU Optimized"
+DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Documents/BabyNoise")
+BUFFER_SIZE = 4096  # Increased audio buffer size for better GPU utilization
+UPDATE_INTERVAL = 50  # ms between UI updates
 
 # Configure logging
 logging.basicConfig(
@@ -35,11 +51,1056 @@ logging.basicConfig(
 )
 logger = logging.getLogger("baby-noise-app")
 
-# Constants
-APP_TITLE = "Baby-Noise Generator v1.2"
-DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Documents/BabyNoise")
-BUFFER_SIZE = 2048  # Audio buffer size for streaming
-UPDATE_INTERVAL = 50  # ms between UI updates
+# Output profiles with specific settings
+NOISE_PROFILES = {
+    "baby-safe": {
+        "rms_target": -63.0,        # Default RMS level (AAP guideline)
+        "lufs_threshold": -27.0,    # LUFS threshold (approx AAP guideline)
+        "peak_ceiling": -3.0,       # True peak ceiling
+        "pre_emphasis": False,      # No pre-emphasis needed
+        "description": "AAP-compliant safe levels"
+    },
+    "youtube-pub": {
+        "rms_target": -20.0,        # Higher RMS for YouTube
+        "lufs_threshold": -16.0,    # LUFS threshold for YouTube
+        "peak_ceiling": -2.0,       # Less headroom needed
+        "pre_emphasis": True,       # Add pre-emphasis for codec resilience
+        "description": "Optimized for YouTube publishing"
+    }
+}
+
+# Get CUDA device properties for optimization decisions
+def get_device_info():
+    """Get basic information about the CUDA device"""
+    device_id = cp.cuda.device.get_device_id()
+    device_props = cp.cuda.runtime.getDeviceProperties(device_id)
+    
+    return {
+        "name": device_props["name"].decode(),
+        "compute_capability": f"{device_props['major']}.{device_props['minor']}",
+        "total_memory": device_props["totalGlobalMem"] / (1024**3),  # GB
+        "multiprocessors": device_props["multiProcessorCount"],
+        "max_threads_per_block": device_props["maxThreadsPerBlock"],
+        "mem_clock_rate": device_props["memoryClockRate"] / 1000,  # MHz
+    }
+
+# GPU Memory Optimization - Dynamically adjust block size based on available memory
+def optimize_block_size():
+    """Determine optimal FFT block size based on GPU memory"""
+    device_info = get_device_info()
+    total_mem_gb = device_info["total_memory"]
+    
+    # Scale block size based on available memory
+    # For devices with less than 4GB, use smaller blocks
+    if total_mem_gb < 4.0:
+        return 2**17  # Half the default size
+    elif total_mem_gb > 8.0:
+        return 2**19  # Double the default size for high-memory GPUs
+    else:
+        return FFT_BLOCK_SIZE  # Default size
+
+# Noise configuration dataclass
+class NoiseConfig:
+    def __init__(self, 
+                 seed=None, 
+                 duration=600,
+                 color_mix=None, 
+                 rms_target=-63.0, 
+                 peak_ceiling=-3.0,
+                 lfo_rate=None, 
+                 sample_rate=SAMPLE_RATE, 
+                 channels=1,
+                 profile="baby-safe"):
+        """Initialize noise configuration"""
+        self.seed = seed if seed is not None else int(time.time())
+        self.duration = duration  # seconds
+        self.color_mix = color_mix or {'white': 0.4, 'pink': 0.4, 'brown': 0.2}
+        self.rms_target = rms_target  # dBFS
+        self.peak_ceiling = peak_ceiling  # dBFS
+        self.lfo_rate = lfo_rate  # Hz, None for no modulation
+        self.sample_rate = sample_rate
+        self.use_gpu = True  # Always use GPU in this version
+        self.channels = channels  # 1=mono, 2=stereo
+        self.profile = profile  # Output profile name
+
+    def validate(self):
+        """Validate configuration"""
+        # Normalize color mix to sum to 1.0
+        total = sum(self.color_mix.values())
+        if total > 0:
+            self.color_mix = {k: v / total for k, v in self.color_mix.items()}
+        
+        # Apply profile settings if needed
+        if self.profile in NOISE_PROFILES:
+            profile_settings = NOISE_PROFILES[self.profile]
+            # Only override if not explicitly set
+            if not hasattr(self, '_custom_rms'):
+                self.rms_target = profile_settings.get("rms_target", self.rms_target)
+            if not hasattr(self, '_custom_peak'):
+                self.peak_ceiling = profile_settings.get("peak_ceiling", self.peak_ceiling)
+
+    def set_rms_target(self, value):
+        """Set custom RMS target"""
+        self._custom_rms = True
+        self.rms_target = value
+    
+    def set_peak_ceiling(self, value):
+        """Set custom peak ceiling"""
+        self._custom_peak = True
+        self.peak_ceiling = value
+
+# GPU-accelerated noise generator
+class NoiseGenerator:
+    """GPU-accelerated noise generator for rendering to file"""
+    
+    def __init__(self, config):
+        """Initialize generator with configuration"""
+        self.config = config
+        self.config.validate()
+        self.optimal_block_size = optimize_block_size()
+        self.total_samples = int(self.config.duration * self.config.sample_rate)
+        self.channels = self.config.channels
+        
+        # Initialize filters and state
+        self._init_gpu()
+        self._init_filters()
+        
+        # Progress tracking
+        self.progress_callback = None
+        self.is_cancelled = False
+    
+    def _init_gpu(self):
+        """Initialize GPU context and PRNG"""
+        # Create the PRNG with specified seed
+        self.rng = cp.random.RandomState(seed=self.config.seed)
+        
+        # Get device info for logging
+        device_info = get_device_info()
+        logger.info(f"Using GPU: {device_info['name']} with {device_info['total_memory']:.2f} GB memory")
+        logger.info(f"Compute capability: {device_info['compute_capability']}")
+        
+        # Warm up GPU by allocating a small array
+        warmup = cp.zeros((1024, 1024), dtype=cp.float32)
+        del warmup
+    
+    def _init_filters(self):
+        """Initialize filters for pink and brown noise"""
+        # Create filter coefficients for pink noise
+        # Pink noise approximation using 8th order filter
+        # -10 dB/decade = -3 dB/octave slope
+        self._pink_filter_taps = self._create_pink_filter(4097)
+        
+        # For stereo processing
+        self.decorrelation_phases = None
+        if self.channels == 2:
+            # Create phase shift array for stereo decorrelation
+            # Use different phase shifts across the spectrum for natural stereo image
+            n_freqs = self.optimal_block_size // 2 + 1
+            self.decorrelation_phases = cp.zeros(n_freqs, dtype=cp.complex64)
+            
+            # Create decorrelation with natural frequency-dependent phase differences
+            # Higher frequencies get more decorrelation
+            phases = cp.linspace(0, cp.pi/4, n_freqs)  # 0 to 45 degrees
+            # Apply quadratic curve to phase differences (more in mids and highs)
+            phases = phases**2 / (cp.pi/4)
+            self.decorrelation_phases = cp.exp(1j * phases)
+    
+    def _create_pink_filter(self, n_taps=4097):
+        """Create FIR filter for pink noise using frequency sampling method"""
+        # Create frequency response for pink noise (-10 dB/decade falloff)
+        nyquist = self.config.sample_rate / 2
+        freqs = cp.linspace(0, nyquist, n_taps//2 + 1)
+        # Avoid division by zero
+        freqs[0] = freqs[1]
+        
+        # Create pink spectrum (1/f)
+        response = 1.0 / cp.sqrt(freqs)
+        
+        # Normalize
+        response = response / cp.max(response)
+        
+        # Convert to filter taps using FFT
+        # Frequency sampling approach
+        full_response = cp.concatenate([response, response[-2:0:-1]])
+        filter_taps = cp.real(cp.fft.ifft(full_response))
+        
+        # Window the filter to reduce Gibbs phenomenon
+        window = cp.hamming(len(filter_taps))
+        filter_taps = filter_taps * window
+        
+        # Normalize for unity gain at DC
+        filter_taps = filter_taps / cp.sum(filter_taps)
+        
+        return filter_taps
+    
+    def _generate_white_noise_block(self, block_size):
+        """Generate white noise block on GPU"""
+        if self.channels == 1:
+            # Mono output
+            return self.rng.normal(0, 1, block_size).astype(cp.float32)
+        else:
+            # Stereo output with slight decorrelation
+            noise_left = self.rng.normal(0, 1, block_size).astype(cp.float32)
+            noise_right = self.rng.normal(0, 1, block_size).astype(cp.float32)
+            return cp.vstack((noise_left, noise_right))
+    
+    def _apply_pink_filter(self, white_noise):
+        """Apply pink filter to white noise on GPU"""
+        if self.channels == 1:
+            # Mono processing
+            return cusignal.fftconvolve(white_noise, self._pink_filter_taps, mode='same')
+        else:
+            # Stereo processing
+            left = white_noise[0]
+            right = white_noise[1]
+            
+            # Process each channel
+            pink_left = cusignal.fftconvolve(left, self._pink_filter_taps, mode='same')
+            pink_right = cusignal.fftconvolve(right, self._pink_filter_taps, mode='same')
+            
+            return cp.vstack((pink_left, pink_right))
+    
+    def _generate_brown_noise(self, white_noise):
+        """Generate brown noise from white noise using leaky integration"""
+        if self.channels == 1:
+            # Mono processing
+            # Create brown noise through integration with leaky factor
+            brown = cp.zeros_like(white_noise)
+            
+            # Process in one large vectorized operation with efficient memory access
+            # Brown noise is an IIR filter: y[n] = alpha * y[n-1] + (1-alpha) * x[n]
+            # We can implement this as a cumulative sum with decay
+            alpha = BROWN_LEAKY_ALPHA
+            scale = cp.sqrt(1.0 - alpha*alpha)  # Normalization factor
+            
+            # Optimize using CuPy's cumulative sum
+            brown = cp.zeros_like(white_noise)
+            brown[0] = scale * white_noise[0]
+            
+            # Vectorized implementation using exponential decay
+            indices = cp.arange(1, len(white_noise))
+            decay_factors = alpha ** indices
+            
+            # Apply running sum with exponential decay
+            for i in range(1, len(white_noise)):
+                brown[i] = alpha * brown[i-1] + scale * white_noise[i]
+            
+            # Apply high-pass filter to remove DC offset (20 Hz cutoff)
+            cutoff = 20.0 / (self.config.sample_rate / 2)
+            b, a = cusignal.butter(2, cutoff, 'high')
+            brown = cusignal.lfilter(b, a, brown)
+            
+            return brown
+        else:
+            # Stereo processing - apply to each channel
+            left = white_noise[0]
+            right = white_noise[1]
+            
+            # Process each channel separately
+            brown_left = self._generate_brown_noise(left)
+            brown_right = self._generate_brown_noise(right)
+            
+            return cp.vstack((brown_left, brown_right))
+    
+    def _apply_stereo_decorrelation(self, noise_block):
+        """Apply stereo decorrelation in frequency domain for realistic stereo field"""
+        if self.channels == 1:
+            return noise_block
+        
+        # Get left and right channels
+        left = noise_block[0]
+        right = noise_block[1]
+        
+        # Process right channel for decorrelation (leave left untouched as reference)
+        # Convert to frequency domain
+        right_fft = cufft.rfft(right)
+        
+        # Apply phase shift for decorrelation
+        right_fft = right_fft * self.decorrelation_phases
+        
+        # Convert back to time domain
+        right_decorrelated = cufft.irfft(right_fft, n=len(right))
+        
+        # Recombine channels
+        return cp.vstack((left, right_decorrelated))
+    
+    def _apply_gain_and_limiting(self, noise_block, target_rms, peak_ceiling):
+        """Apply gain adjustment and limiting"""
+        # Handle mono vs stereo
+        if self.channels == 1:
+            # Calculate current RMS
+            current_rms = cp.sqrt(cp.mean(noise_block**2))
+            
+            # Calculate gain needed
+            target_linear = 10 ** (target_rms / 20.0)
+            gain = target_linear / (current_rms + 1e-10)
+            
+            # Apply gain
+            noise_block = noise_block * gain
+            
+            # Apply limiting if needed
+            peak = cp.max(cp.abs(noise_block))
+            peak_threshold = 10 ** (peak_ceiling / 20.0)
+            
+            if peak > peak_threshold:
+                limiting_gain = peak_threshold / peak
+                noise_block = noise_block * limiting_gain
+                logger.info(f"Applied limiting: {20*cp.log10(limiting_gain):.1f} dB")
+        else:
+            # For stereo, process combined energy
+            # Calculate RMS across both channels
+            combined_rms = cp.sqrt(cp.mean((noise_block[0]**2 + noise_block[1]**2) / 2))
+            
+            # Calculate gain needed
+            target_linear = 10 ** (target_rms / 20.0)
+            gain = target_linear / (combined_rms + 1e-10)
+            
+            # Apply gain to both channels
+            noise_block = noise_block * gain
+            
+            # Apply limiting if needed (check both channels)
+            peak_left = cp.max(cp.abs(noise_block[0]))
+            peak_right = cp.max(cp.abs(noise_block[1]))
+            peak = cp.maximum(peak_left, peak_right)
+            peak_threshold = 10 ** (peak_ceiling / 20.0)
+            
+            if peak > peak_threshold:
+                limiting_gain = peak_threshold / peak
+                noise_block = noise_block * limiting_gain
+                logger.info(f"Applied limiting: {20*cp.log10(limiting_gain):.1f} dB")
+        
+        return noise_block
+    
+    def _apply_true_peak_limiting(self, noise_block, peak_ceiling):
+        """Apply true-peak limiting with 4x oversampling"""
+        # True peak detection using 4x oversampling
+        oversampling_factor = 4
+        
+        if self.channels == 1:
+            # Mono processing
+            # Upsample for true-peak detection
+            upsampled = cusignal.resample(noise_block, len(noise_block) * oversampling_factor)
+            
+            # Find true peak
+            true_peak = cp.max(cp.abs(upsampled))
+            true_peak_db = 20 * cp.log10(true_peak + 1e-10)
+            
+            # Apply limiting if needed
+            peak_threshold = 10 ** (peak_ceiling / 20.0)
+            if true_peak > peak_threshold:
+                limiting_gain = peak_threshold / true_peak
+                noise_block = noise_block * limiting_gain
+                logger.info(f"Applied true-peak limiting: {20*cp.log10(limiting_gain):.1f} dB")
+        else:
+            # Stereo processing
+            # Process each channel
+            upsampled_left = cusignal.resample(noise_block[0], len(noise_block[0]) * oversampling_factor)
+            upsampled_right = cusignal.resample(noise_block[1], len(noise_block[1]) * oversampling_factor)
+            
+            # Find true peak across both channels
+            true_peak_left = cp.max(cp.abs(upsampled_left))
+            true_peak_right = cp.max(cp.abs(upsampled_right))
+            true_peak = cp.maximum(true_peak_left, true_peak_right)
+            true_peak_db = 20 * cp.log10(true_peak + 1e-10)
+            
+            # Apply limiting if needed
+            peak_threshold = 10 ** (peak_ceiling / 20.0)
+            if true_peak > peak_threshold:
+                limiting_gain = peak_threshold / true_peak
+                noise_block = noise_block * limiting_gain
+                logger.info(f"Applied true-peak limiting: {20*cp.log10(limiting_gain):.1f} dB")
+        
+        return noise_block
+    
+    def _apply_pre_emphasis(self, noise_block):
+        """Apply pre-emphasis filter for better codec performance on YouTube"""
+        if not NOISE_PROFILES.get(self.config.profile, {}).get("pre_emphasis", False):
+            return noise_block
+        
+        # Pre-emphasis filter (boost above 5kHz for YouTube codec)
+        nyquist = self.config.sample_rate / 2
+        cutoff = 5000 / nyquist
+        
+        # Design shelving filter
+        b, a = cusignal.butter(2, cutoff, 'high', analog=False)
+        
+        # Apply gain to shelving filter
+        b = b * 1.5  # +3.5 dB boost
+        
+        if self.channels == 1:
+            # Apply filter
+            emphasized = cusignal.lfilter(b, a, noise_block)
+            
+            # Re-normalize to maintain RMS
+            original_rms = cp.sqrt(cp.mean(noise_block**2))
+            emphasized_rms = cp.sqrt(cp.mean(emphasized**2))
+            gain_factor = original_rms / (emphasized_rms + 1e-10)
+            
+            return emphasized * gain_factor
+        else:
+            # Process each channel
+            emphasized_left = cusignal.lfilter(b, a, noise_block[0])
+            emphasized_right = cusignal.lfilter(b, a, noise_block[1])
+            
+            # Re-normalize to maintain RMS
+            original_rms = cp.sqrt(cp.mean((noise_block[0]**2 + noise_block[1]**2) / 2))
+            emphasized_rms = cp.sqrt(cp.mean((emphasized_left**2 + emphasized_right**2) / 2))
+            gain_factor = original_rms / (emphasized_rms + 1e-10)
+            
+            return cp.vstack((emphasized_left * gain_factor, emphasized_right * gain_factor))
+    
+    def _apply_lfo_modulation(self, noise_block, block_start_idx):
+        """Apply LFO modulation if enabled"""
+        if self.config.lfo_rate is None:
+            return noise_block
+        
+        # Create LFO modulation envelope
+        block_len = noise_block.shape[-1]
+        block_time = block_len / self.config.sample_rate
+        
+        # Generate time indices for this block
+        t_start = block_start_idx / self.config.sample_rate
+        t = cp.linspace(t_start, t_start + block_time, block_len, endpoint=False)
+        
+        # Create sinusoidal modulation (±1dB)
+        modulation_depth = 10**(1.0/20) - 10**(-1.0/20)  # ±1dB in linear scale
+        modulation = 1.0 + modulation_depth/2 * cp.sin(2 * cp.pi * self.config.lfo_rate * t)
+        
+        # Apply modulation
+        if self.channels == 1:
+            return noise_block * modulation
+        else:
+            # Apply same modulation to both channels
+            return cp.vstack((noise_block[0] * modulation, noise_block[1] * modulation))
+    
+    def _blend_noise_colors(self, white, pink, brown, color_mix):
+        """Blend different noise colors on GPU according to color mix"""
+        white_gain = cp.sqrt(color_mix.get('white', 0))
+        pink_gain = cp.sqrt(color_mix.get('pink', 0))
+        brown_gain = cp.sqrt(color_mix.get('brown', 0))
+        
+        # Normalize to ensure consistent levels regardless of mix
+        total_power = white_gain**2 + pink_gain**2 + brown_gain**2
+        normalization = cp.sqrt(1.0 / (total_power + 1e-10))
+        
+        white_gain *= normalization
+        pink_gain *= normalization
+        brown_gain *= normalization
+        
+        if self.channels == 1:
+            # Mix mono signals
+            return (white * white_gain + 
+                    pink * pink_gain + 
+                    brown * brown_gain)
+        else:
+            # Mix stereo signals (channel-wise)
+            left_mix = (white[0] * white_gain + 
+                       pink[0] * pink_gain + 
+                       brown[0] * brown_gain)
+            
+            right_mix = (white[1] * white_gain + 
+                        pink[1] * pink_gain + 
+                        brown[1] * brown_gain)
+            
+            return cp.vstack((left_mix, right_mix))
+    
+    def generate_block(self, block_size, block_start_idx=0):
+        """Generate a block of noise with the specified configuration"""
+        # Generate white noise base
+        white_noise = self._generate_white_noise_block(block_size)
+        
+        # Generate pink noise from white noise
+        pink_noise = self._apply_pink_filter(white_noise)
+        
+        # Generate brown noise from white noise
+        brown_noise = self._generate_brown_noise(white_noise)
+        
+        # Blend according to color mix
+        mixed_noise = self._blend_noise_colors(
+            white_noise, pink_noise, brown_noise, self.config.color_mix
+        )
+        
+        # Apply stereo decorrelation if needed
+        if self.channels == 2:
+            mixed_noise = self._apply_stereo_decorrelation(mixed_noise)
+        
+        # Apply LFO modulation if enabled
+        if self.config.lfo_rate is not None:
+            mixed_noise = self._apply_lfo_modulation(mixed_noise, block_start_idx)
+        
+        # Apply gain and limiting
+        mixed_noise = self._apply_gain_and_limiting(
+            mixed_noise, self.config.rms_target, self.config.peak_ceiling
+        )
+        
+        # Apply true-peak limiting
+        mixed_noise = self._apply_true_peak_limiting(mixed_noise, self.config.peak_ceiling)
+        
+        # Apply pre-emphasis if enabled in profile
+        mixed_noise = self._apply_pre_emphasis(mixed_noise)
+        
+        return mixed_noise
+    
+    def generate_to_file(self, output_path, progress_callback=None):
+        """Generate noise and save to file with progress tracking"""
+        self.progress_callback = progress_callback
+        self.is_cancelled = False
+        
+        start_time = time.time()
+        
+        # Determine format based on extension
+        _, ext = os.path.splitext(output_path)
+        if ext.lower() == '.flac':
+            output_format = 'FLAC'
+            subtype = None
+        else:
+            output_format = 'WAV'
+            # Determine bit depth
+            subtype = 'PCM_24'  # Default to 24-bit
+        
+        # Create output file
+        with sf.SoundFile(
+            output_path, 
+            mode='w', 
+            samplerate=self.config.sample_rate,
+            channels=self.channels,
+            format=output_format,
+            subtype=subtype
+        ) as f:
+            # Process in blocks to manage memory
+            samples_remaining = self.total_samples
+            samples_written = 0
+            block_size = self.optimal_block_size
+            
+            # Large overlap for smooth transitions
+            overlap = BLOCK_OVERLAP
+            overlap_buffer = None
+            
+            while samples_remaining > 0 and not self.is_cancelled:
+                # Determine block size for this iteration
+                current_block_size = min(block_size, samples_remaining + overlap)
+                
+                # Generate block
+                noise_block = self.generate_block(current_block_size, samples_written)
+                
+                # Move from GPU to CPU
+                if self.channels == 1:
+                    output_data = cp.asnumpy(noise_block)
+                else:
+                    # Transpose for soundfile's expected format
+                    output_data = cp.asnumpy(noise_block.T)
+                
+                # Apply overlap from previous block if available
+                if overlap_buffer is not None:
+                    # Crossfade with previous block's overlap region
+                    fade_in = np.linspace(0, 1, overlap)
+                    fade_out = np.linspace(1, 0, overlap)
+                    
+                    if self.channels == 1:
+                        output_data[:overlap] = (
+                            output_data[:overlap] * fade_in + 
+                            overlap_buffer * fade_out
+                        )
+                    else:
+                        output_data[:overlap, :] = (
+                            output_data[:overlap, :] * fade_in[:, np.newaxis] + 
+                            overlap_buffer * fade_out[:, np.newaxis]
+                        )
+                
+                # Save overlap buffer for next iteration
+                if samples_remaining > overlap:
+                    if self.channels == 1:
+                        overlap_buffer = output_data[-overlap:].copy()
+                    else:
+                        overlap_buffer = output_data[-overlap:, :].copy()
+                
+                # Write to file (excluding overlap for next block)
+                write_length = min(len(output_data) - overlap, samples_remaining)
+                f.write(output_data[:write_length])
+                
+                # Update progress
+                samples_written += write_length
+                samples_remaining -= write_length
+                
+                # Report progress
+                if self.progress_callback:
+                    progress_percent = (samples_written / self.total_samples) * 100
+                    self.progress_callback(progress_percent)
+        
+        # Calculate processing metrics
+        end_time = time.time()
+        processing_time = end_time - start_time
+        
+        # Measure output file statistics
+        result = {
+            "processing_time": processing_time,
+            "samples_generated": samples_written,
+            "real_time_factor": self.config.duration / processing_time,
+        }
+        
+        logger.info(f"Generated {self.config.duration:.1f}s of noise in {processing_time:.1f}s "
+                    f"(speed: {result['real_time_factor']:.1f}x real-time)")
+        
+        # Measure true peak and RMS on disk to verify
+        try:
+            audio_data, _ = sf.read(output_path)
+            if self.channels == 2:
+                # Calculate metrics on both channels
+                peak_left = np.max(np.abs(audio_data[:, 0]))
+                peak_right = np.max(np.abs(audio_data[:, 1]))
+                peak_db = 20 * np.log10(max(peak_left, peak_right) + 1e-10)
+                
+                # Calculate LUFS using a simplified method
+                # For accurate LUFS, use pyloudnorm or similar library
+                rms_left = np.sqrt(np.mean(audio_data[:, 0]**2))
+                rms_right = np.sqrt(np.mean(audio_data[:, 1]**2))
+                rms_db = 20 * np.log10((rms_left + rms_right) / 2 + 1e-10)
+                
+                # Approximate LUFS from RMS
+                lufs = rms_db + 3.0  # Simple approximation
+            else:
+                # Calculate metrics for mono
+                peak_db = 20 * np.log10(np.max(np.abs(audio_data)) + 1e-10)
+                rms_db = 20 * np.log10(np.sqrt(np.mean(audio_data**2)) + 1e-10)
+                lufs = rms_db + 3.0  # Simple approximation
+            
+            result["peak_db"] = peak_db
+            result["rms_db"] = rms_db
+            result["integrated_lufs"] = lufs
+            
+            logger.info(f"Output file metrics: {peak_db:.1f} dBFS peak, {lufs:.1f} LUFS")
+        except Exception as e:
+            logger.error(f"Error measuring output file: {e}")
+        
+        return result
+    
+    def cancel_generation(self):
+        """Cancel ongoing generation"""
+        self.is_cancelled = True
+
+
+# Streaming noise generator for real-time playback
+class StreamingNoiseGenerator:
+    """Streaming noise generator for real-time playback with GPU acceleration"""
+    
+    def __init__(self, config):
+        """Initialize streaming generator"""
+        self.config = config
+        self.config.validate()
+        
+        # Initialize GPU context and filters
+        self._init_gpu()
+        self._init_filters()
+        
+        # State for streaming
+        self.position = 0
+        self.stream_buffer_size = STREAM_BUFFER_SIZE
+        self.buffer_queue = queue.Queue(maxsize=3)
+        self.running = False
+        self.thread = None
+        
+        # Start background processing
+        self._start_background_thread()
+    
+    def _init_gpu(self):
+        """Initialize GPU context and PRNG"""
+        # Create the PRNG with specified seed
+        self.rng = cp.random.RandomState(seed=self.config.seed)
+        
+        # Warm up GPU by allocating a small array
+        warmup = cp.zeros((1024, 1024), dtype=cp.float32)
+        del warmup
+    
+    def _init_filters(self):
+        """Initialize filters for pink and brown noise"""
+        # Pink noise filter (shorter for real-time)
+        self._pink_filter_taps = self._create_pink_filter(2049)
+        
+        # For stereo processing
+        self.decorrelation_phases = None
+        if self.config.channels == 2:
+            # Create phase shift array for stereo decorrelation
+            n_freqs = self.stream_buffer_size // 2 + 1
+            self.decorrelation_phases = cp.zeros(n_freqs, dtype=cp.complex64)
+            
+            # Create decorrelation with natural frequency-dependent phase differences
+            phases = cp.linspace(0, cp.pi/4, n_freqs)  # 0 to 45 degrees
+            phases = phases**2 / (cp.pi/4)  # Apply quadratic curve
+            self.decorrelation_phases = cp.exp(1j * phases)
+    
+    def _create_pink_filter(self, n_taps=2049):
+        """Create FIR filter for pink noise (simplified for streaming)"""
+        # Create frequency response for pink noise (-10 dB/decade falloff)
+        nyquist = self.config.sample_rate / 2
+        freqs = cp.linspace(0, nyquist, n_taps//2 + 1)
+        freqs[0] = freqs[1]  # Avoid division by zero
+        
+        # Create pink spectrum (1/f)
+        response = 1.0 / cp.sqrt(freqs)
+        
+        # Normalize
+        response = response / cp.max(response)
+        
+        # Convert to filter taps using FFT
+        full_response = cp.concatenate([response, response[-2:0:-1]])
+        filter_taps = cp.real(cp.fft.ifft(full_response))
+        
+        # Window the filter
+        window = cp.hamming(len(filter_taps))
+        filter_taps = filter_taps * window
+        
+        # Normalize for unity gain at DC
+        filter_taps = filter_taps / cp.sum(filter_taps)
+        
+        return filter_taps
+    
+    def _start_background_thread(self):
+        """Start background thread for buffer generation"""
+        self.running = True
+        self.thread = threading.Thread(target=self._buffer_generation_thread, daemon=True)
+        self.thread.start()
+    
+    def _buffer_generation_thread(self):
+        """Background thread to pre-generate buffers"""
+        while self.running:
+            if self.buffer_queue.qsize() < 2:
+                # Generate a new buffer
+                buffer_size = self.stream_buffer_size
+                noise_block = self._generate_buffer(buffer_size)
+                
+                try:
+                    self.buffer_queue.put(noise_block, block=False)
+                except queue.Full:
+                    # Queue is full, discard this buffer
+                    pass
+            else:
+                # Sleep to avoid busy waiting
+                time.sleep(0.01)
+    
+    def _generate_buffer(self, buffer_size):
+        """Generate a buffer of noise"""
+        # Generate base white noise
+        if self.config.channels == 1:
+            white_noise = self.rng.normal(0, 1, buffer_size).astype(cp.float32)
+        else:
+            # Stereo with decorrelation
+            white_left = self.rng.normal(0, 1, buffer_size).astype(cp.float32)
+            white_right = self.rng.normal(0, 1, buffer_size).astype(cp.float32)
+            white_noise = cp.vstack((white_left, white_right))
+        
+        # Generate pink noise
+        if self.config.channels == 1:
+            pink_noise = cusignal.fftconvolve(white_noise, self._pink_filter_taps, mode='same')
+        else:
+            pink_left = cusignal.fftconvolve(white_noise[0], self._pink_filter_taps, mode='same')
+            pink_right = cusignal.fftconvolve(white_noise[1], self._pink_filter_taps, mode='same')
+            pink_noise = cp.vstack((pink_left, pink_right))
+        
+        # Generate brown noise
+        if self.config.channels == 1:
+            # Apply leaky integration
+            brown_noise = cp.zeros_like(white_noise)
+            alpha = BROWN_LEAKY_ALPHA
+            scale = cp.sqrt(1.0 - alpha*alpha)  # Normalization factor
+            
+            brown_noise[0] = scale * white_noise[0]
+            for i in range(1, len(white_noise)):
+                brown_noise[i] = alpha * brown_noise[i-1] + scale * white_noise[i]
+            
+            # Apply high-pass filter to remove DC offset
+            cutoff = 20.0 / (self.config.sample_rate / 2)
+            b, a = cusignal.butter(2, cutoff, 'high')
+            brown_noise = cusignal.lfilter(b, a, brown_noise)
+        else:
+            # Process each channel
+            brown_left = cp.zeros_like(white_noise[0])
+            brown_right = cp.zeros_like(white_noise[1])
+            
+            alpha = BROWN_LEAKY_ALPHA
+            scale = cp.sqrt(1.0 - alpha*alpha)
+            
+            # Process left channel
+            brown_left[0] = scale * white_noise[0][0]
+            for i in range(1, len(white_noise[0])):
+                brown_left[i] = alpha * brown_left[i-1] + scale * white_noise[0][i]
+            
+            # Process right channel
+            brown_right[0] = scale * white_noise[1][0]
+            for i in range(1, len(white_noise[1])):
+                brown_right[i] = alpha * brown_right[i-1] + scale * white_noise[1][i]
+            
+            # Apply high-pass filter
+            cutoff = 20.0 / (self.config.sample_rate / 2)
+            b, a = cusignal.butter(2, cutoff, 'high')
+            brown_left = cusignal.lfilter(b, a, brown_left)
+            brown_right = cusignal.lfilter(b, a, brown_right)
+            
+            brown_noise = cp.vstack((brown_left, brown_right))
+        
+        # Blend according to color mix
+        white_gain = cp.sqrt(self.config.color_mix.get('white', 0))
+        pink_gain = cp.sqrt(self.config.color_mix.get('pink', 0))
+        brown_gain = cp.sqrt(self.config.color_mix.get('brown', 0))
+        
+        # Normalize
+        total_power = white_gain**2 + pink_gain**2 + brown_gain**2
+        normalization = cp.sqrt(1.0 / (total_power + 1e-10))
+        
+        white_gain *= normalization
+        pink_gain *= normalization
+        brown_gain *= normalization
+        
+        # Blend noise types
+        if self.config.channels == 1:
+            mixed_noise = (white_noise * white_gain + 
+                          pink_noise * pink_gain + 
+                          brown_noise * brown_gain)
+        else:
+            left_mix = (white_noise[0] * white_gain + 
+                       pink_noise[0] * pink_gain + 
+                       brown_noise[0] * brown_gain)
+            
+            right_mix = (white_noise[1] * white_gain + 
+                        pink_noise[1] * pink_gain + 
+                        brown_noise[1] * brown_gain)
+            
+            mixed_noise = cp.vstack((left_mix, right_mix))
+        
+        # Apply stereo decorrelation if needed
+        if self.config.channels == 2:
+            # Apply in frequency domain
+            right_fft = cufft.rfft(mixed_noise[1])
+            right_fft = right_fft * self.decorrelation_phases
+            right_decorrelated = cufft.irfft(right_fft, n=len(mixed_noise[1]))
+            mixed_noise = cp.vstack((mixed_noise[0], right_decorrelated))
+        
+        # Apply LFO modulation if enabled
+        if self.config.lfo_rate is not None:
+            t = cp.linspace(
+                self.position / self.config.sample_rate,
+                (self.position + buffer_size) / self.config.sample_rate,
+                buffer_size, endpoint=False
+            )
+            
+            # Create sinusoidal modulation (±1dB)
+            modulation_depth = 10**(1.0/20) - 10**(-1.0/20)
+            modulation = 1.0 + modulation_depth/2 * cp.sin(2 * cp.pi * self.config.lfo_rate * t)
+            
+            if self.config.channels == 1:
+                mixed_noise = mixed_noise * modulation
+            else:
+                # Apply to both channels
+                mixed_noise = cp.vstack((mixed_noise[0] * modulation, mixed_noise[1] * modulation))
+        
+        # Apply gain and limiting
+        if self.config.channels == 1:
+            # Calculate current RMS
+            current_rms = cp.sqrt(cp.mean(mixed_noise**2))
+            
+            # Calculate gain needed
+            target_linear = 10 ** (self.config.rms_target / 20.0)
+            gain = target_linear / (current_rms + 1e-10)
+            
+            # Apply gain
+            mixed_noise = mixed_noise * gain
+            
+            # Apply peak limiting
+            peak = cp.max(cp.abs(mixed_noise))
+            peak_threshold = 10 ** (self.config.peak_ceiling / 20.0)
+            
+            if peak > peak_threshold:
+                limiting_gain = peak_threshold / peak
+                mixed_noise = mixed_noise * limiting_gain
+        else:
+            # Stereo processing
+            # Calculate RMS across both channels
+            combined_rms = cp.sqrt(cp.mean((mixed_noise[0]**2 + mixed_noise[1]**2) / 2))
+            
+            # Calculate gain needed
+            target_linear = 10 ** (self.config.rms_target / 20.0)
+            gain = target_linear / (combined_rms + 1e-10)
+            
+            # Apply gain to both channels
+            mixed_noise = mixed_noise * gain
+            
+            # Apply limiting if needed
+            peak_left = cp.max(cp.abs(mixed_noise[0]))
+            peak_right = cp.max(cp.abs(mixed_noise[1]))
+            peak = cp.maximum(peak_left, peak_right)
+            peak_threshold = 10 ** (self.config.peak_ceiling / 20.0)
+            
+            if peak > peak_threshold:
+                limiting_gain = peak_threshold / peak
+                mixed_noise = mixed_noise * limiting_gain
+        
+        # Apply pre-emphasis if enabled
+        if NOISE_PROFILES.get(self.config.profile, {}).get("pre_emphasis", False):
+            # Design shelving filter
+            nyquist = self.config.sample_rate / 2
+            cutoff = 5000 / nyquist
+            b, a = cusignal.butter(2, cutoff, 'high', analog=False)
+            b = b * 1.5  # +3.5 dB boost
+            
+            if self.config.channels == 1:
+                # Apply filter
+                mixed_noise = cusignal.lfilter(b, a, mixed_noise)
+            else:
+                # Process each channel
+                mixed_noise = cp.vstack((
+                    cusignal.lfilter(b, a, mixed_noise[0]),
+                    cusignal.lfilter(b, a, mixed_noise[1])
+                ))
+        
+        # Update position
+        self.position += buffer_size
+        
+        # Transfer to CPU
+        if self.config.channels == 1:
+            return cp.asnumpy(mixed_noise)
+        else:
+            # Transpose for output format
+            return cp.asnumpy(mixed_noise.T)
+    
+    def get_next_chunk(self, chunk_size):
+        """Get next chunk of audio for streaming"""
+        # Try to get a pre-generated buffer
+        try:
+            if not self.buffer_queue.empty():
+                buffer = self.buffer_queue.get(block=False)
+                
+                # Return appropriate sized chunk
+                if len(buffer) >= chunk_size:
+                    if self.config.channels == 1:
+                        return buffer[:chunk_size]
+                    else:
+                        return buffer[:chunk_size, :]
+                else:
+                    # Buffer too small, pad with zeros
+                    if self.config.channels == 1:
+                        result = np.zeros(chunk_size, dtype=np.float32)
+                        result[:len(buffer)] = buffer
+                    else:
+                        result = np.zeros((chunk_size, 2), dtype=np.float32)
+                        result[:len(buffer), :] = buffer
+                    return result
+            else:
+                # Generate directly (should be rare if background thread is working)
+                logger.warning("Buffer queue empty, generating directly")
+                noise_block = self._generate_buffer(chunk_size)
+                return noise_block
+        except Exception as e:
+            logger.error(f"Error getting next chunk: {e}")
+            # Return silence on error
+            if self.config.channels == 1:
+                return np.zeros(chunk_size, dtype=np.float32)
+            else:
+                return np.zeros((chunk_size, 2), dtype=np.float32)
+    
+    def shutdown(self):
+        """Shutdown the streaming generator"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+
+
+# Helper functions
+def load_preset(preset_name):
+    """Load a preset from the presets.yaml file"""
+    preset_path = os.path.join(os.path.dirname(__file__), "presets.yaml")
+    
+    with open(preset_path, 'r') as f:
+        presets_data = yaml.safe_load(f)
+    
+    presets = presets_data["presets"]
+    
+    if preset_name not in presets:
+        preset_name = "default"
+    
+    return presets[preset_name]
+
+
+def warmth_to_color_mix(warmth):
+    """Convert warmth parameter (0-100) to color mix dict"""
+    warmth_frac = warmth / 100.0
+    
+    if warmth_frac < 0.33:
+        # 0-33%: Mostly white to equal white/pink
+        t = warmth_frac * 3  # 0-1
+        white = 1.0 - 0.5 * t
+        pink = 0.5 * t
+        brown = 0.0
+    elif warmth_frac < 0.67:
+        # 33-67%: Equal white/pink to equal pink/brown
+        t = (warmth_frac - 0.33) * 3  # 0-1
+        white = 0.5 - 0.5 * t
+        pink = 0.5
+        brown = 0.0 + 0.5 * t
+    else:
+        # 67-100%: Equal pink/brown to mostly brown
+        t = (warmth_frac - 0.67) * 3  # 0-1
+        white = 0.0
+        pink = 0.5 - 0.4 * t
+        brown = 0.5 + 0.4 * t
+    
+    # Normalize to sum to 1.0
+    total = white + pink + brown
+    return {
+        'white': white / total,
+        'pink': pink / total,
+        'brown': brown / total
+    }
+
+
+def generate_stereo_noise(config):
+    """Generate stereo noise with the given configuration"""
+    # Force stereo mode
+    config.channels = 2
+    config.validate()
+    
+    # Create generator and generate
+    generator = NoiseGenerator(config)
+    
+    # Determine the total number of samples
+    total_samples = int(config.duration * config.sample_rate)
+    
+    # Generate in one large block
+    noise_block = generator.generate_block(total_samples)
+    
+    # Transfer to CPU
+    return cp.asnumpy(noise_block.T)  # Transpose for correct stereo format
+
+
+def measure_true_peak(audio_data, sample_rate=SAMPLE_RATE):
+    """Measure true peak level with 4x oversampling"""
+    # Convert to GPU
+    if audio_data.ndim == 1:
+        # Mono
+        gpu_data = cp.asarray(audio_data)
+        
+        # Upsample
+        oversampled = cusignal.resample(gpu_data, len(gpu_data) * 4)
+        
+        # Find peak
+        true_peak = float(cp.max(cp.abs(oversampled)))
+        true_peak_db = 20 * np.log10(true_peak + 1e-10)
+        
+        return true_peak_db
+    else:
+        # Multi-channel
+        left = cp.asarray(audio_data[:, 0])
+        right = cp.asarray(audio_data[:, 1])
+        
+        # Upsample
+        left_over = cusignal.resample(left, len(left) * 4)
+        right_over = cusignal.resample(right, len(right) * 4)
+        
+        # Find peak across channels
+        peak_left = float(cp.max(cp.abs(left_over)))
+        peak_right = float(cp.max(cp.abs(right_over)))
+        true_peak = max(peak_left, peak_right)
+        true_peak_db = 20 * np.log10(true_peak + 1e-10)
+        
+        return true_peak_db
 
 
 class BabyNoiseApp:
@@ -78,6 +1139,21 @@ class BabyNoiseApp:
         self.profile_var = tk.StringVar(value="baby-safe")
         self.channels_var = tk.IntVar(value=1)  # 1=mono, 2=stereo
         self.output_format_var = tk.StringVar(value="WAV (24-bit)")
+        
+        # Check for GPU
+        try:
+            device_info = get_device_info()
+            logger.info(f"Using GPU: {device_info['name']} with {device_info['total_memory']:.2f} GB memory")
+        except Exception as e:
+            logger.error(f"No CUDA GPU detected: {e}")
+            messagebox.showerror(
+                "GPU Required", 
+                "This version requires a CUDA-compatible GPU.\n"
+                "No compatible GPU was detected.\n\n"
+                "Please ensure you have a CUDA-compatible NVIDIA GPU and the correct drivers installed."
+            )
+            self.root.destroy()
+            return
         
         # Current metrics
         self.current_rms = -100.0
@@ -255,6 +1331,13 @@ class BabyNoiseApp:
         ttk.Combobox(format_frame, textvariable=self.output_format_var, 
                     values=["WAV (16-bit)", "WAV (24-bit)", "FLAC"]).pack(side=tk.LEFT, padx=5)
         
+        # Add GPU info label
+        device_info = get_device_info()
+        gpu_info = ttk.Label(format_frame, 
+                            text=f"Using: {device_info['name']} ({device_info['total_memory']:.1f} GB)", 
+                            font=("", 8, "italic"))
+        gpu_info.pack(side=tk.LEFT, padx=5)
+        
         # Render button and progress bar
         render_button_frame = ttk.Frame(render_frame)
         render_button_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -287,7 +1370,7 @@ class BabyNoiseApp:
     
     def _create_status_bar(self):
         """Create the status bar"""
-        self.status_var = tk.StringVar(value="Ready")
+        self.status_var = tk.StringVar(value="Ready - GPU Accelerated")
         self.status_bar = ttk.Label(self.main_frame, textvariable=self.status_var, 
                                    relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.pack(fill=tk.X, padx=5, pady=2)
@@ -407,8 +1490,7 @@ class BabyNoiseApp:
             return
         
         # Create configuration for streaming
-        config, _ = self.create_config()
-        config.use_gpu = False  # Force CPU for streaming
+        config = self.create_config()[0]
         
         # Create generator
         self.generator = StreamingNoiseGenerator(config)
@@ -439,7 +1521,7 @@ class BabyNoiseApp:
         
         self.streaming = True
         self.play_button.configure(text="⏹ Stop")
-        self.status_var.set("Playing...")
+        self.status_var.set("Playing... (GPU Accelerated)")
     
     def stop_streaming(self):
         """Stop audio streaming"""
@@ -454,7 +1536,7 @@ class BabyNoiseApp:
         
         self.streaming = False
         self.play_button.configure(text="▶ Play")
-        self.status_var.set("Stopped")
+        self.status_var.set("Ready - GPU Accelerated")
         
         # Clear audio queue
         while not self.audio_queue.empty():
@@ -522,7 +1604,6 @@ class BabyNoiseApp:
             peak_ceiling=peak_ceiling,
             lfo_rate=lfo_rate,
             sample_rate=SAMPLE_RATE,
-            use_gpu=auto_select_backend(),
             channels=self.channels_var.get(),
             profile=profile
         )
@@ -580,7 +1661,7 @@ class BabyNoiseApp:
         config, output_format = self.create_config()
         
         # Update status and disable render button
-        self.status_var.set(f"Rendering to {os.path.basename(output_path)}...")
+        self.status_var.set(f"Rendering to {os.path.basename(output_path)}... (GPU Accelerated)")
         self.render_button.configure(state=tk.DISABLED)
         self.progress_var.set(0)
         self.root.update()
@@ -602,10 +1683,12 @@ class BabyNoiseApp:
             _, ext = os.path.splitext(output_path)
             
             # Update status (on main thread) with correct extension
-            self.root.after(0, lambda: self.status_var.set(f"Rendering to {os.path.basename(output_path)}..."))
+            self.root.after(0, lambda: self.status_var.set(
+                f"Rendering to {os.path.basename(output_path)}... (GPU Accelerated)"
+            ))
             
             # Generate to file
-            result = generator.generate_to_file(output_path)
+            result = generator.generate_to_file(output_path, self.update_progress)
             
             # Update UI from main thread
             self.root.after(0, lambda: self._render_complete(output_path, result))
@@ -617,10 +1700,13 @@ class BabyNoiseApp:
         """Called when rendering is complete"""
         self.render_button.configure(state=tk.NORMAL)
         
+        # Show real-time factor in status
         if result:
+            real_time_factor = result.get('real_time_factor', 0)
             self.status_var.set(
                 f"Rendered to {os.path.basename(output_path)} "
-                f"({result['integrated_lufs']:.1f} LUFS, {result['peak_db']:.1f} dBFS peak)"
+                f"({result['integrated_lufs']:.1f} LUFS, {result['peak_db']:.1f} dBFS peak, "
+                f"{real_time_factor:.1f}x real-time)"
             )
         else:
             self.status_var.set(f"Rendered to {os.path.basename(output_path)}")
@@ -911,10 +1997,21 @@ class BabyNoiseApp:
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Baby-Noise Generator GUI")
+    parser = argparse.ArgumentParser(description="Baby-Noise Generator GUI (GPU-Optimized)")
     parser.add_argument("--profile", choices=["baby-safe", "youtube-pub"], default="baby-safe",
                        help="Default output profile")
     args = parser.parse_args()
+    
+    # Check for GPU availability before starting
+    try:
+        device_info = get_device_info()
+        logger.info(f"Using GPU: {device_info['name']} with {device_info['total_memory']:.2f} GB memory")
+    except Exception as e:
+        logger.error(f"No CUDA GPU detected: {e}")
+        print(f"ERROR: No CUDA GPU detected: {e}")
+        print("This GPU-optimized version requires a CUDA-compatible GPU.")
+        print("Please ensure you have a CUDA-compatible NVIDIA GPU and the correct drivers installed.")
+        return 1
     
     # Create output directory
     os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
@@ -931,7 +2028,9 @@ def main():
     
     # Start the main loop
     root.mainloop()
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
