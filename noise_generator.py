@@ -368,6 +368,9 @@ class NoiseGenerator:
                self.config.color_mix.get('pink', 0.0) * pink +
                self.config.color_mix.get('brown', 0.0) * brown)
         
+        # Ensure final mix is normalized to RMS = 1
+        mix = mix / xp.sqrt(xp.mean(mix**2))
+        
         return mix
     
     def apply_lfo_modulation(self, audio: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
@@ -477,7 +480,7 @@ class NoiseGenerator:
         Returns:
             Tuple of (integrated_lufs, peak_db)
         """
-        logger.info(f"Measuring loudness of {file_path}")
+        logger.info(f"Measuring LUFS loudness of {file_path}")
         
         # Get file info to determine measurement strategy
         info = sf.info(file_path)
@@ -578,6 +581,56 @@ class NoiseGenerator:
         logger.info(f"Measured approximate LUFS: {pseudo_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
         return pseudo_lufs, peak_db
     
+    def measure_file_rms(self, file_path: str) -> float:
+        """Measure RMS of an audio file in dBFS
+        
+        Args:
+            file_path: Path to the audio file
+            
+        Returns:
+            RMS level in dBFS
+        """
+        logger.info(f"Measuring RMS of {file_path}")
+        
+        # Get file info to determine measurement strategy
+        info = sf.info(file_path)
+        file_size = os.path.getsize(file_path)
+        
+        # For small files, read all at once
+        if file_size < MAX_FILE_SIZE_FOR_DIRECT_READ:
+            # Read entire file
+            audio, sr = sf.read(file_path)
+            
+            # Calculate RMS
+            rms = np.sqrt(np.mean(audio**2))
+            rms_db = 20 * np.log10(rms + 1e-10)
+            
+            logger.info(f"Measured file RMS: {rms_db:.1f} dBFS")
+            return rms_db
+        
+        # For larger files, calculate in chunks
+        with sf.SoundFile(file_path, 'r') as f:
+            chunk_size = f.samplerate * 5  # 5-second chunks
+            sum_sq = 0.0
+            samples = 0
+            
+            while True:
+                chunk = f.read(chunk_size)
+                if len(chunk) == 0:
+                    break
+                sum_sq += np.sum(chunk**2)
+                samples += len(chunk)
+        
+        # Calculate overall RMS
+        if samples > 0:
+            rms = np.sqrt(sum_sq / samples)
+            rms_db = 20 * np.log10(rms + 1e-10)
+        else:
+            rms_db = -100.0
+            
+        logger.info(f"Measured file RMS: {rms_db:.1f} dBFS")
+        return rms_db
+    
     def generate_raw_buffer(self) -> np.ndarray:
         """Generate a buffer of raw noise (mixed but without final gain/limiting)"""
         # Generate white noise
@@ -654,35 +707,40 @@ class NoiseGenerator:
             logger.info("Pass 1: Generating raw audio without normalization...")
             self._generate_raw_file(temp_path)
             
-            # Measure the complete file's LUFS and peak
+            # Measure the raw file's RMS, LUFS and peak
+            raw_rms_db = self.measure_file_rms(temp_path)
             integrated_lufs, peak_db = self.measure_file_loudness(temp_path)
-            logger.info(f"Raw audio measurements - Integrated LUFS: {integrated_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
+            logger.info(f"Raw audio measurements - RMS: {raw_rms_db:.1f} dBFS, LUFS: {integrated_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
             
             # PASS 2: Compute gain and normalize
             logger.info("Pass 2: Computing gain and normalizing...")
             
-            # Step 1: Align to target level
-            target_lufs = self.config.rms_target  # Use RMS target as LUFS target
-            gain_db = target_lufs - integrated_lufs
+            # Step 1: Compute base gain from RMS target
+            target_rms_db = self.config.rms_target
+            gain_db = target_rms_db - raw_rms_db
+            logger.info(f"Base RMS gain: {gain_db:.1f} dB (Target: {target_rms_db:.1f} dBFS)")
             
-            # Step 2: Apply safety threshold if needed
-            overshoot = integrated_lufs - SAFETY_LUFS_THRESHOLD
-            if overshoot > 0:
-                safety_gain_db = -overshoot
+            # Step 2: Predict resulting LUFS after RMS gain
+            predicted_lufs = integrated_lufs + gain_db
+            logger.info(f"Predicted LUFS after gain: {predicted_lufs:.1f}")
+            
+            # Step 3: Apply safety threshold if needed
+            if predicted_lufs > SAFETY_LUFS_THRESHOLD:
+                safety_gain_db = SAFETY_LUFS_THRESHOLD - predicted_lufs
                 gain_db += safety_gain_db
                 logger.warning(
-                    f"LUFS {integrated_lufs:.1f} exceeds safety threshold {SAFETY_LUFS_THRESHOLD:.1f}. "
+                    f"Predicted LUFS {predicted_lufs:.1f} exceeds safety threshold {SAFETY_LUFS_THRESHOLD:.1f}. "
                     f"Applying additional {safety_gain_db:.1f} dB reduction."
                 )
             
-            # Step 3: Check if limiting is needed for peak
+            # Step 4: Check peak levels after gain
             predicted_peak_db = peak_db + gain_db
             if predicted_peak_db > self.config.peak_ceiling:
                 limiting_gain_db = self.config.peak_ceiling - predicted_peak_db
                 gain_db += limiting_gain_db
                 logger.info(
-                    f"Applying peak limiting: {limiting_gain_db:.1f} dB "
-                    f"({predicted_peak_db:.1f} dBFS -> {self.config.peak_ceiling:.1f} dBFS)"
+                    f"Predicted peak {predicted_peak_db:.1f} dBFS exceeds ceiling {self.config.peak_ceiling:.1f} dBFS. "
+                    f"Applying {limiting_gain_db:.1f} dB limiting."
                 )
             
             # Apply the calculated gain to the raw file
@@ -695,6 +753,7 @@ class NoiseGenerator:
         
         # Return metrics
         return {
+            "raw_rms_db": raw_rms_db,
             "integrated_lufs": integrated_lufs,
             "peak_db": peak_db,
             "applied_gain_db": gain_db,
@@ -706,22 +765,24 @@ class NoiseGenerator:
         """Apply RMS target and peak ceiling with LUFS-based safety control - for streaming use"""
         xp = cp if self.config.use_gpu and HAS_CUPY else np
         
-        # Calculate LUFS for 1-second windows
+        # Calculate LUFS and RMS
         loudness_values, integrated_lufs = self.calculate_lufs(audio, window_size_sec=1.0)
+        current_rms = xp.sqrt(xp.mean(audio**2))
+        current_rms_db = 20 * xp.log10(current_rms + 1e-10)
         
-        # Calculate current RMS level
-        current_rms_db = 20 * xp.log10(xp.sqrt(xp.mean(audio**2)) + 1e-10)
+        # Step 1: Calculate gain needed to reach target RMS
+        target_rms_db = self.config.rms_target
+        gain_db = target_rms_db - current_rms_db
         
-        # Calculate gain needed to reach target RMS
-        gain_db = self.config.rms_target - current_rms_db
+        # Step 2: Predict resulting LUFS after RMS gain
+        predicted_lufs = integrated_lufs + gain_db
         
-        # Apply safety gain reduction if LUFS exceeds threshold
-        overshoot = integrated_lufs - SAFETY_LUFS_THRESHOLD
-        if overshoot > 0:
-            safety_gain_db = -overshoot
+        # Step 3: Apply safety gain reduction if predicted LUFS exceeds threshold
+        if predicted_lufs > SAFETY_LUFS_THRESHOLD:
+            safety_gain_db = SAFETY_LUFS_THRESHOLD - predicted_lufs
             gain_db += safety_gain_db
             logger.warning(
-                f"LUFS {integrated_lufs:.1f} exceeds safety threshold {SAFETY_LUFS_THRESHOLD:.1f}. "
+                f"Predicted LUFS {predicted_lufs:.1f} exceeds safety threshold {SAFETY_LUFS_THRESHOLD:.1f}. "
                 f"Applying additional {safety_gain_db:.1f} dB reduction."
             )
         
