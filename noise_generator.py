@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Baby-Noise Generator v1.1
+# Baby-Noise Generator v1.2
 # GPU-accelerated white/pink/brown noise generator for infant sleep
 
 import argparse
@@ -9,8 +9,10 @@ import yaml
 import numpy as np
 import scipy.signal
 import soundfile as sf
+import tempfile
+import contextlib
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union, List
+from typing import Dict, Optional, Tuple, Union, List, BinaryIO
 import logging
 from functools import lru_cache
 
@@ -47,9 +49,24 @@ CPU_BUFFER_SIZE = 2048               # Small buffer for real-time CPU processing
 BROWN_HPF_FREQ = 20.0       # Hz - remove DC offset and ultra-low freqs
 BROWN_LEAKY_ALPHA = 0.999   # Leaky integrator coefficient
 SAFETY_LUFS_THRESHOLD = -27.0  # LUFS threshold (~50 dB SPL)
+MAX_FILE_SIZE_FOR_DIRECT_READ = 100 * 1024 * 1024  # 100MB - threshold for single-read vs. chunked
 
 # Module-level cache for FIR filters
 _pink_fir_cache = {}
+
+
+@contextlib.contextmanager
+def temp_wav_file():
+    """Context manager for temporary wave file that ensures cleanup"""
+    with tempfile.NamedTemporaryFile(suffix='.raw.wav', delete=False) as tmp:
+        temp_path = tmp.name
+    try:
+        yield temp_path
+    finally:
+        try:
+            os.unlink(temp_path)
+        except Exception as e:
+            logger.warning(f"Could not remove temporary file {temp_path}: {str(e)}")
 
 
 @lru_cache(maxsize=8)
@@ -75,6 +92,113 @@ def get_pink_fir(sample_rate, n_taps=4097):
         _pink_fir_cache[cache_key] = impulse
     
     return _pink_fir_cache[cache_key]
+
+
+def process_audio_file(input_path: str, output_path: str, gain_db: float, 
+                      peak_limit_db: float, output_format: str = "PCM_16") -> None:
+    """Process audio file with gain and optional limiting/dithering
+    
+    Args:
+        input_path: Path to input audio file
+        output_path: Path to output audio file
+        gain_db: Gain to apply in dB
+        peak_limit_db: Maximum allowed peak in dBFS
+        output_format: Output format (e.g., "PCM_16" for 16-bit PCM)
+    """
+    # Calculate linear gain
+    linear_gain = 10 ** (gain_db / 20)
+    
+    # Get file info to determine processing strategy
+    info = sf.info(input_path)
+    file_size = os.path.getsize(input_path)
+    
+    # Choose processing strategy based on file size
+    if file_size < MAX_FILE_SIZE_FOR_DIRECT_READ:
+        # Small file: read all at once
+        logger.info(f"Processing {input_path} in single pass (size: {file_size/1024/1024:.1f} MB)")
+        
+        # Read entire file
+        audio, sr = sf.read(input_path)
+        
+        # Apply gain
+        audio = audio * linear_gain
+        
+        # Check for limiting
+        peak = np.max(np.abs(audio))
+        peak_db = 20 * np.log10(peak + 1e-10)
+        
+        if peak_db > peak_limit_db:
+            limiting_gain = 10 ** ((peak_limit_db - peak_db) / 20)
+            audio = audio * limiting_gain
+            logger.info(f"Applied limiting: {limiting_gain:.3f} ({peak_db:.1f} dBFS -> {peak_limit_db:.1f} dBFS)")
+        
+        # Apply dither if needed
+        if output_format in ["PCM_16", "PCM_24"]:
+            # Calculate appropriate dither amplitude based on bit depth
+            bits = 16 if output_format == "PCM_16" else 24
+            amplitude = 2.0 / (2**bits - 1)
+            
+            # Apply TPDF dither
+            dither = np.random.uniform(-amplitude, amplitude, len(audio)) - \
+                     np.random.uniform(-amplitude, amplitude, len(audio))
+            audio = audio + dither
+        
+        # Write output
+        sf.write(output_path, audio, sr, subtype=output_format)
+        
+    else:
+        # Large file: process in chunks
+        logger.info(f"Processing {input_path} in chunks (size: {file_size/1024/1024:.1f} MB)")
+        
+        # Process in ~5 second chunks
+        chunk_size = info.samplerate * 5
+        
+        with sf.SoundFile(input_path, 'r') as infile, \
+             sf.SoundFile(output_path, 'w', samplerate=infile.samplerate, 
+                         channels=infile.channels, subtype=output_format) as outfile:
+            
+            # Track progress
+            samples_processed = 0
+            last_logged_percent = -10  # Initialize to ensure first chunk logs
+            
+            while True:
+                chunk = infile.read(chunk_size)
+                if len(chunk) == 0:
+                    break
+                
+                # Apply gain
+                chunk = chunk * linear_gain
+                
+                # Check for limiting in each chunk
+                peak = np.max(np.abs(chunk))
+                peak_db = 20 * np.log10(peak + 1e-10)
+                
+                if peak_db > peak_limit_db:
+                    limiting_gain = 10 ** ((peak_limit_db - peak_db) / 20)
+                    chunk = chunk * limiting_gain
+                
+                # Apply dither if needed
+                if output_format in ["PCM_16", "PCM_24"]:
+                    # Calculate appropriate dither amplitude based on bit depth
+                    bits = 16 if output_format == "PCM_16" else 24
+                    amplitude = 2.0 / (2**bits - 1)
+                    
+                    # Apply TPDF dither
+                    dither = np.random.uniform(-amplitude, amplitude, len(chunk)) - \
+                             np.random.uniform(-amplitude, amplitude, len(chunk))
+                    chunk = chunk + dither
+                
+                # Write to output file
+                outfile.write(chunk)
+                
+                # Update progress tracking
+                samples_processed += len(chunk)
+                progress_percent = samples_processed / infile.frames * 100
+                
+                # Log progress at 10% increments
+                if progress_percent - last_logged_percent >= 10 or progress_percent >= 100:
+                    logger.info(f"Processing progress: {progress_percent:.1f}%")
+                    last_logged_percent = progress_percent
 
 
 @dataclass
@@ -344,8 +468,242 @@ class NoiseGenerator:
         else:
             return xp.array([]), -100.0
     
+    def measure_file_loudness(self, file_path: str) -> Tuple[float, float]:
+        """Measure the integrated LUFS and peak level of an entire audio file
+        
+        Args:
+            file_path: Path to the audio file
+            
+        Returns:
+            Tuple of (integrated_lufs, peak_db)
+        """
+        logger.info(f"Measuring loudness of {file_path}")
+        
+        # Get file info to determine measurement strategy
+        info = sf.info(file_path)
+        file_size = os.path.getsize(file_path)
+        
+        if HAS_PYLOUDNORM:
+            try:
+                # If file is small enough, read it all at once for accurate measurement
+                if file_size < MAX_FILE_SIZE_FOR_DIRECT_READ:
+                    # Read entire file
+                    audio, sr = sf.read(file_path)
+                    
+                    # Calculate true integrated LUFS
+                    integrated_lufs = self.lufs_meter.integrated_loudness(audio)
+                    
+                    # Calculate peak
+                    peak = np.max(np.abs(audio))
+                    peak_db = 20 * np.log10(peak + 1e-10)
+                    
+                    logger.info(f"Measured integrated LUFS: {integrated_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
+                    return integrated_lufs, peak_db
+                
+                # For larger files, use block-based measurement with buffering
+                meter = pyln.Meter(info.samplerate)
+                blocks = []  # Buffer for K-weighted blocks
+                max_peak = 0.0
+                
+                # Process in blocks of 1-10 seconds
+                seconds_per_block = min(10, max(1, self.config.duration / 20))  # Max 20 blocks
+                block_size = int(seconds_per_block * info.samplerate)
+                
+                with sf.SoundFile(file_path, 'r') as f:
+                    while True:
+                        block = f.read(block_size)
+                        if len(block) == 0:
+                            break
+                        
+                        # Update peak
+                        block_peak = np.max(np.abs(block))
+                        max_peak = max(max_peak, block_peak)
+                        
+                        # Save block for combined measurement
+                        blocks.append(block)
+                
+                # Combine blocks for integrated measurement
+                if blocks:
+                    combined = np.concatenate(blocks)
+                    integrated_lufs = meter.integrated_loudness(combined)
+                else:
+                    integrated_lufs = -100.0
+                
+                # Calculate peak in dB
+                peak_db = 20 * np.log10(max_peak + 1e-10)
+                
+                logger.info(f"Measured integrated LUFS: {integrated_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
+                return integrated_lufs, peak_db
+                
+            except Exception as e:
+                logger.warning(f"Error in pyloudnorm file measurement: {str(e)}. Falling back to RMS.")
+                # Fall through to simplified RMS-based measurement
+        
+        # Fallback to RMS-based measurement
+        logger.info("Using simplified RMS-based loudness measurement")
+        with sf.SoundFile(file_path, 'r') as f:
+            # Process in chunks of ~5 seconds
+            chunk_size = f.samplerate * 5
+            
+            # Initialize RMS and peak tracking
+            rms_sum = 0.0
+            sample_count = 0
+            peak = 0.0
+            
+            # Process file in chunks
+            while True:
+                chunk = f.read(chunk_size)
+                if len(chunk) == 0:
+                    break
+                    
+                # Update RMS sum
+                rms_sum += np.sum(chunk**2)
+                sample_count += len(chunk)
+                
+                # Update peak
+                chunk_peak = np.max(np.abs(chunk))
+                peak = max(peak, chunk_peak)
+            
+            # Calculate final RMS and convert to LUFS-like scale
+            if sample_count > 0:
+                rms = np.sqrt(rms_sum / sample_count)
+                # Approximate LUFS from RMS (-0.691 is an offset to roughly align with LUFS)
+                pseudo_lufs = -0.691 + 10 * np.log10(rms**2 + 1e-10)
+            else:
+                pseudo_lufs = -100.0
+            
+            # Calculate peak in dB
+            peak_db = 20 * np.log10(peak + 1e-10)
+            
+        logger.info(f"Measured approximate LUFS: {pseudo_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
+        return pseudo_lufs, peak_db
+    
+    def generate_raw_buffer(self) -> np.ndarray:
+        """Generate a buffer of raw noise (mixed but without final gain/limiting)"""
+        # Generate white noise
+        white = self.generate_white_noise(self.buffer_samples)
+        
+        # Generate pink and brown from white
+        pink = self.generate_pink_noise(white)
+        brown = self.generate_brown_noise(white)
+        
+        # Mix colors
+        audio = self.apply_color_mix(white, pink, brown)
+        
+        # Apply LFO modulation if configured
+        if self.config.lfo_rate:
+            audio = self.apply_lfo_modulation(audio)
+            
+        # Move to CPU if on GPU
+        if self.config.use_gpu and HAS_CUPY:
+            audio = cp.asnumpy(audio)
+            
+        return audio
+    
+    def _generate_raw_file(self, output_path: str) -> None:
+        """Generate raw noise file without final gain control (first pass)"""
+        # Store original buffer size 
+        orig_buffer_samples = self.buffer_samples
+        samples_written = 0
+        last_logged_percent = -10
+        
+        # Create output file for FLOAT samples (no dither needed)
+        with sf.SoundFile(output_path, mode='w', samplerate=self.config.sample_rate, 
+                        channels=1, subtype='FLOAT') as f:
+            
+            # Generate and write buffers
+            for i in range(self.num_buffers):
+                remaining = self.total_samples - samples_written
+                actual_buffer_samples = min(orig_buffer_samples, remaining)
+                
+                # Temporarily adjust buffer size for this iteration only
+                self.buffer_samples = actual_buffer_samples
+                
+                # Generate raw buffer
+                buffer = self.generate_raw_buffer()
+                
+                # Write to file
+                f.write(buffer)
+                samples_written += len(buffer)
+                
+                # Log progress in 10% increments
+                progress = samples_written / self.total_samples * 100
+                if progress - last_logged_percent >= 10 or progress >= 100:
+                    logger.info(f"Pass 1 progress: {progress:.1f}%")
+                    last_logged_percent = progress
+        
+        # Restore original buffer size
+        self.buffer_samples = orig_buffer_samples
+    
+    def generate_to_file(self, output_path: str) -> Dict:
+        """Generate noise and write to file using two-pass approach for better loudness control"""
+        logger.info(f"Generating {self.config.duration:.1f}s of noise to {output_path}")
+        logger.info(f"Using {'GPU' if self.config.use_gpu and HAS_CUPY else 'CPU'} backend")
+        logger.info(f"Seed: {self.config.seed}")
+        logger.info(f"Color mix: {self.config.color_mix}")
+        
+        start_time = time.time()
+        
+        # Determine output format from file extension
+        _, ext = os.path.splitext(output_path)
+        output_format = "PCM_16" if ext.lower() == ".wav" else "FLAC" if ext.lower() == ".flac" else "PCM_16"
+        
+        # Use context manager for temp file to ensure cleanup
+        with temp_wav_file() as temp_path:
+            # PASS 1: Generate raw audio and measure
+            logger.info("Pass 1: Generating raw audio without normalization...")
+            self._generate_raw_file(temp_path)
+            
+            # Measure the complete file's LUFS and peak
+            integrated_lufs, peak_db = self.measure_file_loudness(temp_path)
+            logger.info(f"Raw audio measurements - Integrated LUFS: {integrated_lufs:.1f}, Peak: {peak_db:.1f} dBFS")
+            
+            # PASS 2: Compute gain and normalize
+            logger.info("Pass 2: Computing gain and normalizing...")
+            
+            # Step 1: Align to target level
+            target_lufs = self.config.rms_target  # Use RMS target as LUFS target
+            gain_db = target_lufs - integrated_lufs
+            
+            # Step 2: Apply safety threshold if needed
+            overshoot = integrated_lufs - SAFETY_LUFS_THRESHOLD
+            if overshoot > 0:
+                safety_gain_db = -overshoot
+                gain_db += safety_gain_db
+                logger.warning(
+                    f"LUFS {integrated_lufs:.1f} exceeds safety threshold {SAFETY_LUFS_THRESHOLD:.1f}. "
+                    f"Applying additional {safety_gain_db:.1f} dB reduction."
+                )
+            
+            # Step 3: Check if limiting is needed for peak
+            predicted_peak_db = peak_db + gain_db
+            if predicted_peak_db > self.config.peak_ceiling:
+                limiting_gain_db = self.config.peak_ceiling - predicted_peak_db
+                gain_db += limiting_gain_db
+                logger.info(
+                    f"Applying peak limiting: {limiting_gain_db:.1f} dB "
+                    f"({predicted_peak_db:.1f} dBFS -> {self.config.peak_ceiling:.1f} dBFS)"
+                )
+            
+            # Apply the calculated gain to the raw file
+            logger.info(f"Processing with total gain of {gain_db:.1f} dB")
+            process_audio_file(temp_path, output_path, gain_db, self.config.peak_ceiling, output_format)
+        
+        # Calculate total processing time
+        elapsed = time.time() - start_time
+        logger.info(f"Generated {self.config.duration:.1f}s of noise in {elapsed:.1f}s")
+        
+        # Return metrics
+        return {
+            "integrated_lufs": integrated_lufs,
+            "peak_db": peak_db,
+            "applied_gain_db": gain_db,
+            "output_path": output_path,
+            "processing_time": elapsed
+        }
+    
     def apply_loudness_control(self, audio: Union[np.ndarray, "cp.ndarray"]) -> Union[np.ndarray, "cp.ndarray"]:
-        """Apply RMS target and peak ceiling with LUFS-based safety control"""
+        """Apply RMS target and peak ceiling with LUFS-based safety control - for streaming use"""
         xp = cp if self.config.use_gpu and HAS_CUPY else np
         
         # Calculate LUFS for 1-second windows
@@ -357,15 +715,13 @@ class NoiseGenerator:
         # Calculate gain needed to reach target RMS
         gain_db = self.config.rms_target - current_rms_db
         
-        # AAP safety threshold (approximately -27 LUFS for 50 dB SPL)
-        safety_lufs_threshold = SAFETY_LUFS_THRESHOLD
-        
         # Apply safety gain reduction if LUFS exceeds threshold
-        if integrated_lufs > safety_lufs_threshold:
-            safety_gain_db = safety_lufs_threshold - integrated_lufs
+        overshoot = integrated_lufs - SAFETY_LUFS_THRESHOLD
+        if overshoot > 0:
+            safety_gain_db = -overshoot
             gain_db += safety_gain_db
             logger.warning(
-                f"LUFS {integrated_lufs:.1f} exceeds safety threshold {safety_lufs_threshold:.1f}. "
+                f"LUFS {integrated_lufs:.1f} exceeds safety threshold {SAFETY_LUFS_THRESHOLD:.1f}. "
                 f"Applying additional {safety_gain_db:.1f} dB reduction."
             )
         
@@ -409,20 +765,22 @@ class NoiseGenerator:
             audio_cpu = cp.asnumpy(audio)
             
             # Generate and apply dither on CPU to avoid extra GPU->CPU transfer
-            amplitude = 2.0 / (2**16 - 1)
+            bits = 16 if output_format == "PCM_16" else 24
+            amplitude = 2.0 / (2**bits - 1)
             dither = np.random.uniform(-amplitude, amplitude, len(audio_cpu)) - \
                      np.random.uniform(-amplitude, amplitude, len(audio_cpu))
             return audio_cpu + dither
         else:
             # CPU path remains unchanged
             xp = np
-            amplitude = 2.0 / (2**16 - 1)
+            bits = 16 if output_format == "PCM_16" else 24
+            amplitude = 2.0 / (2**bits - 1)
             dither = xp.random.uniform(-amplitude, amplitude, len(audio)) - \
                      xp.random.uniform(-amplitude, amplitude, len(audio))
             return audio + dither
     
     def generate_buffer(self, output_format: str = "PCM_16") -> Tuple[np.ndarray, Dict]:
-        """Generate a buffer of noise according to configuration"""
+        """Generate a buffer of noise according to configuration - for streaming use"""
         # Generate white noise
         white = self.generate_white_noise(self.buffer_samples)
         
@@ -450,67 +808,6 @@ class NoiseGenerator:
         }
         
         return audio, metrics
-    
-    def generate_to_file(self, output_path: str) -> Dict:
-        """Generate noise and write to file"""
-        logger.info(f"Generating {self.config.duration:.1f}s of noise to {output_path}")
-        logger.info(f"Using {'GPU' if self.config.use_gpu and HAS_CUPY else 'CPU'} backend")
-        logger.info(f"Seed: {self.config.seed}")
-        logger.info(f"Color mix: {self.config.color_mix}")
-        
-        start_time = time.time()
-        samples_written = 0
-        metrics = {"buffers": [], "avg_rms_db": 0, "peak_db": -np.inf}
-        
-        # Determine output format from file extension
-        _, ext = os.path.splitext(output_path)
-        output_format = "PCM_16" if ext.lower() == ".wav" else "FLAC" if ext.lower() == ".flac" else "PCM_16"
-        
-        # Store original buffer size to avoid UI progress jumps
-        orig_buffer_samples = self.buffer_samples
-        
-        # Create output file
-        with sf.SoundFile(output_path, mode='w', samplerate=self.config.sample_rate, 
-                          channels=1, subtype=output_format) as f:
-            
-            # Generate and write buffers
-            for i in range(self.num_buffers):
-                remaining = self.total_samples - samples_written
-                actual_buffer_samples = min(orig_buffer_samples, remaining)
-                
-                # Temporarily adjust buffer_samples for this iteration only
-                self.buffer_samples = actual_buffer_samples
-                
-                # Generate buffer
-                buffer, buffer_metrics = self.generate_buffer(output_format)
-                
-                # Write to file
-                f.write(buffer)
-                samples_written += len(buffer)
-                
-                # Update metrics
-                metrics["buffers"].append(buffer_metrics)
-                metrics["avg_rms_db"] += buffer_metrics["rms_db"] / self.num_buffers
-                metrics["peak_db"] = max(metrics["peak_db"], buffer_metrics["peak_db"])
-                
-                # Log progress
-                if i % max(1, self.num_buffers // 10) == 0 or i == self.num_buffers - 1:
-                    progress = samples_written / self.total_samples * 100
-                    elapsed = time.time() - start_time
-                    logger.info(f"Progress: {progress:.1f}% ({elapsed:.1f}s elapsed)")
-        
-        # Restore original buffer size
-        self.buffer_samples = orig_buffer_samples
-        
-        # Log completion
-        elapsed = time.time() - start_time
-        logger.info(f"Generated {self.config.duration:.1f}s of noise in {elapsed:.1f}s")
-        logger.info(f"Average RMS: {metrics['avg_rms_db']:.1f} dBFS, Peak: {metrics['peak_db']:.1f} dBFS")
-        
-        # Add metadata to file
-        # Note: This would require additional libraries like mutagen
-        
-        return metrics
 
 
 class StreamingNoiseGenerator(NoiseGenerator):
@@ -525,6 +822,19 @@ class StreamingNoiseGenerator(NoiseGenerator):
         self.pink_state = np.zeros(self.pink_octaves)  # Using improved Voss-McCartney
         self.pink_last_value = 0.0
         self.brown_prev = 0.0
+        
+        # For streaming, we pre-calculate color-specific loudness adjustments
+        # to ensure consistent perceived loudness between colors
+        white_ratio = config.color_mix.get('white', 0.0)
+        
+        # Apply loudness calibration based on color mix
+        # White noise is perceptually much louder at the same RMS
+        if white_ratio > 0.8:
+            # For mostly white noise, adjust RMS target to account for perceptual loudness
+            self.adjusted_rms_target = config.rms_target - 15 * (white_ratio - 0.8)
+            logger.info(f"Streaming adjusted RMS target to {self.adjusted_rms_target:.1f} dBFS for {white_ratio:.1f} white noise")
+        else:
+            self.adjusted_rms_target = config.rms_target
     
     def get_next_chunk(self, chunk_size: int = 2048) -> np.ndarray:
         """Generate a chunk of audio for real-time streaming"""
