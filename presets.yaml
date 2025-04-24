@@ -1,4 +1,4 @@
-# Baby-Noise Generator Presets v1.1
+# Baby-Noise Generator Presets v2.0
 # Phase-based noise presets for different infant sleep stages
 # Note: American Academy of Pediatrics (AAP) recommends levels below -60 dBFS (~50 dB SPL)
 
@@ -46,4 +46,26 @@ presets:
   default:
     color_mix: {white: 0.4, pink: 0.4, brown: 0.2}
     rms_target: -63.0  # ~47 dB SPL
+    lfo_rate: 0.1      # Hz
+    
+  # Pure color presets
+  white_only:
+    color_mix: {white: 1.0, pink: 0.0, brown: 0.0}
+    rms_target: -63.0  # ~47 dB SPL
+    lfo_rate: 0.1      # Hz
+    
+  pink_only:
+    color_mix: {white: 0.0, pink: 1.0, brown: 0.0}
+    rms_target: -63.0  # ~47 dB SPL
+    lfo_rate: 0.1      # Hz
+    
+  brown_only:
+    color_mix: {white: 0.0, pink: 0.0, brown: 1.0}
+    rms_target: -63.0  # ~47 dB SPL
+    lfo_rate: 0.1      # Hz
+    
+  # YouTube optimized preset
+  youtube:
+    color_mix: {white: 0.4, pink: 0.4, brown: 0.2}
+    rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
