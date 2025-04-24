@@ -484,8 +484,11 @@ class NoiseGenerator:
         scale = cp.sqrt(1.0 - alpha*alpha)  # Normalization factor
         
         # Apply the filter (much faster than a Python loop)
-        # b=[scale], a=[1, -alpha] implements y[n]=alpha*y[n-1]+scale*x[n]
-        brown = cusignal.lfilter([scale], [1, -alpha], white_noise)
+        # FIX: Explicitly create CuPy arrays for filter coefficients
+        b = cp.array([scale])         # Explicitly create as CuPy array
+        a = cp.array([1.0, -alpha])   # Explicitly create as CuPy array
+        
+        brown = cusignal.lfilter(b, a, white_noise)
         
         # Apply high-pass filter to remove DC offset using second-order sections
         brown = cusignal.sosfilt(self._brown_hp_sos, brown)
@@ -671,8 +674,8 @@ class NoiseGenerator:
         # Design shelving filter
         b, a = cusignal.butter(2, cutoff, 'high', analog=False)
         
-        # Apply gain to shelving filter
-        b = b * 1.5  # +3.5 dB boost
+        # Apply gain to shelving filter - ensure b is a CuPy array
+        b = cp.array(b) * 1.5  # +3.5 dB boost
         
         if self.channels == 1:
             # Apply filter
@@ -926,48 +929,25 @@ class NoiseGenerator:
                     # Calculate safe overlap size
                     overlap = min(BLOCK_OVERLAP, current_block_size - 1, samples_remaining)
                     
-                    # DEBUG PRINTS - Added here to diagnose the error
-                    print("fade_in:", type(self._fade_in))
-                    print("fade_out:", type(self._fade_out))
-                    print("overlap_buffer:", type(overlap_buffer) if overlap_buffer is not None else None)
-                    print("output_data:", type(output_data))
-                    if self.channels == 1:
-                        print("output_data shape:", output_data.shape if hasattr(output_data, 'shape') else 'no shape')
-                    else:
-                        print("output_data shape:", output_data.shape if hasattr(output_data, 'shape') else 'no shape')
-                        
                     # Apply overlap from previous block if available
                     if overlap_buffer is not None:
-                        # DEBUG PRINTS - Added here to diagnose the error
-                        print("overlap:", overlap, "type:", type(overlap))
-                        if hasattr(overlap_buffer, 'shape'):
-                            print("overlap_buffer[:overlap] shape:", overlap_buffer[:overlap].shape if len(overlap_buffer) >= overlap else "overlap too large")
-                        if hasattr(self._fade_in, 'shape'):
-                            print("self._fade_in[:overlap] shape:", self._fade_in[:overlap].shape if len(self._fade_in) >= overlap else "overlap too large")
-                        if hasattr(self._fade_out, 'shape'):
-                            print("self._fade_out[:overlap] shape:", self._fade_out[:overlap].shape if len(self._fade_out) >= overlap else "overlap too large")
-                        
-                        # Ensure all arrays are numpy arrays and have the right shape for the operation
-                        fade_in = np.array(self._fade_in[:overlap])
-                        fade_out = np.array(self._fade_out[:overlap])
-                        
                         # Crossfade with previous block's overlap region
                         if self.channels == 1:
                             output_data[:overlap] = (
-                                output_data[:overlap] * fade_in + 
-                                overlap_buffer[:overlap] * fade_out
+                                output_data[:overlap] * self._fade_in[:overlap] + 
+                                overlap_buffer[:overlap] * self._fade_out[:overlap]
                             )
                         else:
                             # Make sure the fade arrays are properly shaped for broadcasting
-                            fade_in_shaped = fade_in[:, np.newaxis]
-                            fade_out_shaped = fade_out[:, np.newaxis]
+                            fade_in_shaped = self._fade_in[:overlap, np.newaxis]
+                            fade_out_shaped = self._fade_out[:overlap, np.newaxis]
                             
                             output_data[:overlap, :] = (
                                 output_data[:overlap, :] * fade_in_shaped + 
                                 overlap_buffer[:overlap, :] * fade_out_shaped
                             )
                     
-                    # Save overlap buffer for next iteration
+                    # Save overlap buffer for next iteration - ensure explicit array conversion
                     if samples_remaining > overlap:
                         if self.channels == 1:
                             overlap_buffer = np.array(output_data[-overlap:].copy())
