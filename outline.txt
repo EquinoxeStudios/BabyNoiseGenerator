@@ -4,7 +4,7 @@
 ## 1. High‑level goals
 * Single GPU-accelerated engine that can:
    * Render 10‑hour gap‑free WAV/FLAC files for YouTube with **CUDA GPU acceleration**, and
-   * Deliver 75-90x real-time rendering speeds on high-end GPUs
+   * Deliver 75-110x real-time rendering speeds on high-end GPUs
 * Three noise colours (white, pink, brown) with a cross‑fade "warmth" slider
 * Medical‑safe output – long‑term RMS ≲ 50 dB SPL, –1 dBFS peak ceiling. Real‑time LUFS monitoring (60s window) auto‑reduces gain if level > 50 dB SPL (AAP guideline)
 * Deterministic seeds for reproducible renders, with easy randomization per export
@@ -19,7 +19,7 @@ graph TD
   A[Philox white buffer<br><b>CuPy GPU PRNG</b>] --> B{Colour?}
   B -->|white|  C[Gain stage<br><b>GPU vectorized</b>]
   B -->|pink|   D[Pink noise<br><b>FFT-based filtering</b>]
-  B -->|brown|  E[Integrator<br><b>GPU vectorized</b>] --> F[One‑pole 20 Hz HPF<br><b>(2‑tap biquad kernel)</b>]
+  B -->|brown|  E[Brown noise<br><b>Vectorized IIR filter</b>] --> F[SOS 20 Hz HPF<br><b>Second-order sections</b>]
   D --> C
   F --> C
   G[Stereo decorrelation<br><b>FFT-based phase shifts</b>] --> C
@@ -38,7 +38,7 @@ graph TD
    * Efficient decorrelation through frequency-domain phase manipulation
 * **Level control**:
    * GPU-accelerated RMS and LUFS calculation using reduction operations
-   * True-peak limiter with 4x oversampling for intersample peak detection
+   * True-peak limiter with 4x oversampling for intersample peak detection  
 * **Colour slider**:
    * Two-segment blend implementation with normalized power scaling
    * Warmth parameter (0-100%) for intuitive control
@@ -49,9 +49,10 @@ graph TD
 |-----------|--------|----------------|
 | White noise | **CuPy/NumPy Philox** counter‑based PRNG – 2²⁵⁶ period | `rng.normal(0, 1, block_size).astype(cp.float32)` |
 | Pink noise | Frequency-domain filtering with optimized FFT convolution | `cusignal.fftconvolve(white_noise, pink_filter_taps, mode='same')` |
-| Brown noise | Leaky integrator (α≈0.999) → 20 Hz HPF, **vectorized** | `cusignal.lfilter(b, a, brown_noise)` with vectorized integration |
+| Brown noise | **Vectorized IIR filtering** with SOS high-pass | `cusignal.lfilter([scale], [1, -alpha], white_noise)` |
 | Stereo decorrelation | Frequency-dependent phase manipulation (0-45°) | `right_fft = right_fft * decorrelation_phases` |
 | True-peak limiting | 4x oversampling with FFT-based resampling | `cusignal.resample(noise_block, len(noise_block) * 4)` |
+| Error handling | Comprehensive thread-safe exception handling | `try/except` with fallback silence generation |
 
 ## 4. Performance Optimization
 
@@ -60,12 +61,14 @@ graph TD
 * **Parallel filter implementation** for stereo channels
 * **Vectorized operations** for maximum GPU utilization
 * **Efficient FFT planning** with cached filter coefficients
+* **Adaptive progress reporting** with smart throttling
 * **Optimal memory layout** for minimizing transfer overhead
+* **Second-order sections filtering** for improved numerical stability
 
 ### Benchmarking targets
-* **10-hour render**: ≤8 minutes on RTX 3080/4090 (vs. 30+ minutes previously)
+* **10-hour render**: ≤7 minutes on RTX 3080/4090 (vs. 30+ minutes previously)
 * **Memory footprint**: Scales automatically from 2GB to 8GB+ based on GPU capability
-* **Real-time factor**: 75-90x real-time on high-end GPUs, 25-30x on mid-range GPUs
+* **Real-time factor**: 80-110x real-time on high-end GPUs, 25-30x on mid-range GPUs
 
 ## 5. Output Profiles
 

@@ -5,8 +5,6 @@ scipy>=1.7.0
 soundfile>=0.10.0
 sounddevice>=0.4.5
 pyyaml>=5.1.0
-pyloudnorm>=0.1.0  # For ITU-R BS.1770-4 compliant LUFS measurements
-pytest>=7.0.0
 matplotlib>=3.5.0  # For visualization
 
 # Required GPU acceleration (one of the following based on your CUDA version)
@@ -14,11 +12,10 @@ matplotlib>=3.5.0  # For visualization
 # cupy-cuda11x>=12.0.0
 
 # CUDA 12.x (recommended)
-cupy-cuda12x>=12.0.0
+cupy-cuda12x>=12.2.0
 
-# For CUDA installation helper
-cupyx>=12.0.0
+# For GUI
+tk>=0.1.0  # For GUI in most Python installations
 
-# Other optional dependencies
-tk>=0.1.0  # For GUI
-tqdm>=4.60.0  # For progress bars in batch processing
+# Optional enhancements
+# pyloudnorm>=0.1.0  # For ITU-R BS.1770-4 compliant LUFS measurements (optional)
