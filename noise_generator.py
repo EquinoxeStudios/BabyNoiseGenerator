@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Baby-Noise Generator App v1.2 - GPU Optimized
+# Baby-Noise Generator App v2.0 - GPU Optimized
 # Exclusively optimized for GPU acceleration with no CPU fallback
 
 import os
@@ -39,10 +39,20 @@ BROWN_LEAKY_ALPHA = 0.999    # Leaky integrator coefficient
 FFT_BLOCK_SIZE = 2**18       # ~1.5 seconds at 44.1 kHz (large block optimization)
 BLOCK_OVERLAP = 4096         # For smooth transitions between blocks
 STREAM_BUFFER_SIZE = 65536   # Increased buffer size for GPU efficiency
-APP_TITLE = "Baby-Noise Generator v1.2 - GPU Optimized"
+APP_TITLE = "Baby-Noise Generator v2.0 - GPU Optimized"
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Documents/BabyNoise")
 BUFFER_SIZE = 4096  # Increased audio buffer size for better GPU utilization
 UPDATE_INTERVAL = 50  # ms between UI updates
+
+# Adaptive progress throttling based on render duration
+def get_progress_throttle(duration):
+    """Get appropriate throttle interval based on render duration"""
+    if duration < 300:  # < 5 minutes
+        return 0.05  # 50ms for short renders
+    elif duration < 1800:  # < 30 minutes
+        return 0.1  # 100ms for medium renders
+    else:  # >= 30 minutes
+        return 0.3  # 300ms for long renders
 
 # Configure logging
 logging.basicConfig(
@@ -69,20 +79,27 @@ NOISE_PROFILES = {
     }
 }
 
-# Get CUDA device properties for optimization decisions
+# Cache for device info - initialized once and reused
+_device_info_cache = None
+
+# Utility functions
 def get_device_info():
-    """Get basic information about the CUDA device"""
-    device_id = cp.cuda.device.get_device_id()
-    device_props = cp.cuda.runtime.getDeviceProperties(device_id)
+    """Get basic information about the CUDA device (cached)"""
+    global _device_info_cache
+    if _device_info_cache is None:
+        device_id = cp.cuda.device.get_device_id()
+        device_props = cp.cuda.runtime.getDeviceProperties(device_id)
+        
+        _device_info_cache = {
+            "name": device_props["name"].decode(),
+            "compute_capability": f"{device_props['major']}.{device_props['minor']}",
+            "total_memory": device_props["totalGlobalMem"] / (1024**3),  # GB
+            "multiprocessors": device_props["multiProcessorCount"],
+            "max_threads_per_block": device_props["maxThreadsPerBlock"],
+            "mem_clock_rate": device_props["memoryClockRate"] / 1000,  # MHz
+        }
     
-    return {
-        "name": device_props["name"].decode(),
-        "compute_capability": f"{device_props['major']}.{device_props['minor']}",
-        "total_memory": device_props["totalGlobalMem"] / (1024**3),  # GB
-        "multiprocessors": device_props["multiProcessorCount"],
-        "max_threads_per_block": device_props["maxThreadsPerBlock"],
-        "mem_clock_rate": device_props["memoryClockRate"] / 1000,  # MHz
-    }
+    return _device_info_cache
 
 # GPU Memory Optimization - Dynamically adjust block size based on available memory
 def optimize_block_size():
@@ -98,6 +115,43 @@ def optimize_block_size():
         return 2**19  # Double the default size for high-memory GPUs
     else:
         return FFT_BLOCK_SIZE  # Default size
+
+def create_pink_filter(n_taps, sample_rate):
+    """Create FIR filter for pink noise using frequency sampling method"""
+    # Create frequency response for pink noise (-10 dB/decade falloff)
+    nyquist = sample_rate / 2
+    freqs = cp.linspace(0, nyquist, n_taps//2 + 1)
+    # Avoid division by zero
+    freqs[0] = freqs[1]
+    
+    # Create pink spectrum (1/f)
+    response = 1.0 / cp.sqrt(freqs)
+    
+    # Normalize
+    response = response / cp.max(response)
+    
+    # Convert to filter taps using FFT
+    # Frequency sampling approach
+    full_response = cp.concatenate([response, response[-2:0:-1]])
+    filter_taps = cp.real(cp.fft.ifft(full_response))
+    
+    # Window the filter to reduce Gibbs phenomenon
+    window = cp.hamming(len(filter_taps))
+    filter_taps = filter_taps * window
+    
+    # Normalize for unity gain at DC
+    filter_taps = filter_taps / cp.sum(filter_taps)
+    
+    return filter_taps
+
+def normalize_color_mix(color_mix):
+    """Normalize color mix to sum to 1.0"""
+    total = sum(color_mix.values())
+    if total > 0:
+        return {k: v / total for k, v in color_mix.items()}
+    else:
+        # Default if all zeros
+        return {'white': 0.4, 'pink': 0.4, 'brown': 0.2}
 
 # Noise configuration dataclass
 class NoiseConfig:
@@ -126,9 +180,7 @@ class NoiseConfig:
     def validate(self):
         """Validate configuration"""
         # Normalize color mix to sum to 1.0
-        total = sum(self.color_mix.values())
-        if total > 0:
-            self.color_mix = {k: v / total for k, v in self.color_mix.items()}
+        self.color_mix = normalize_color_mix(self.color_mix)
         
         # Apply profile settings if needed
         if self.profile in NOISE_PROFILES:
@@ -188,7 +240,12 @@ class NoiseGenerator:
         # Create filter coefficients for pink noise
         # Pink noise approximation using 8th order filter
         # -10 dB/decade = -3 dB/octave slope
-        self._pink_filter_taps = self._create_pink_filter(4097)
+        self._pink_filter_taps = create_pink_filter(4097, self.config.sample_rate)
+        
+        # Precompute highpass filter coefficients for brown noise
+        cutoff = 20.0 / (self.config.sample_rate / 2)
+        # Use second-order sections form for better numerical stability
+        self._brown_hp_sos = cusignal.butter(2, cutoff, 'high', output='sos')
         
         # For stereo processing
         self.decorrelation_phases = None
@@ -204,34 +261,6 @@ class NoiseGenerator:
             # Apply quadratic curve to phase differences (more in mids and highs)
             phases = phases**2 / (cp.pi/4)
             self.decorrelation_phases = cp.exp(1j * phases)
-    
-    def _create_pink_filter(self, n_taps=4097):
-        """Create FIR filter for pink noise using frequency sampling method"""
-        # Create frequency response for pink noise (-10 dB/decade falloff)
-        nyquist = self.config.sample_rate / 2
-        freqs = cp.linspace(0, nyquist, n_taps//2 + 1)
-        # Avoid division by zero
-        freqs[0] = freqs[1]
-        
-        # Create pink spectrum (1/f)
-        response = 1.0 / cp.sqrt(freqs)
-        
-        # Normalize
-        response = response / cp.max(response)
-        
-        # Convert to filter taps using FFT
-        # Frequency sampling approach
-        full_response = cp.concatenate([response, response[-2:0:-1]])
-        filter_taps = cp.real(cp.fft.ifft(full_response))
-        
-        # Window the filter to reduce Gibbs phenomenon
-        window = cp.hamming(len(filter_taps))
-        filter_taps = filter_taps * window
-        
-        # Normalize for unity gain at DC
-        filter_taps = filter_taps / cp.sum(filter_taps)
-        
-        return filter_taps
     
     def _generate_white_noise_block(self, block_size):
         """Generate white noise block on GPU"""
@@ -260,45 +289,34 @@ class NoiseGenerator:
             
             return cp.vstack((pink_left, pink_right))
     
+    def _generate_brown_mono(self, white_noise):
+        """Generate brown noise from white noise using vectorized IIR filtering"""
+        # Brown noise is an IIR filter: y[n] = alpha * y[n-1] + scale * x[n]
+        alpha = BROWN_LEAKY_ALPHA
+        scale = cp.sqrt(1.0 - alpha*alpha)  # Normalization factor
+        
+        # Apply the filter (much faster than a Python loop)
+        # b=[scale], a=[1, -alpha] implements y[n]=alpha*y[n-1]+scale*x[n]
+        brown = cusignal.lfilter([scale], [1, -alpha], white_noise)
+        
+        # Apply high-pass filter to remove DC offset using second-order sections
+        brown = cusignal.sosfilt(self._brown_hp_sos, brown)
+        
+        return brown
+    
     def _generate_brown_noise(self, white_noise):
         """Generate brown noise from white noise using leaky integration"""
         if self.channels == 1:
             # Mono processing
-            # Create brown noise through integration with leaky factor
-            brown = cp.zeros_like(white_noise)
-            
-            # Process in one large vectorized operation with efficient memory access
-            # Brown noise is an IIR filter: y[n] = alpha * y[n-1] + (1-alpha) * x[n]
-            # We can implement this as a cumulative sum with decay
-            alpha = BROWN_LEAKY_ALPHA
-            scale = cp.sqrt(1.0 - alpha*alpha)  # Normalization factor
-            
-            # Optimize using CuPy's cumulative sum
-            brown = cp.zeros_like(white_noise)
-            brown[0] = scale * white_noise[0]
-            
-            # Vectorized implementation using exponential decay
-            indices = cp.arange(1, len(white_noise))
-            decay_factors = alpha ** indices
-            
-            # Apply running sum with exponential decay
-            for i in range(1, len(white_noise)):
-                brown[i] = alpha * brown[i-1] + scale * white_noise[i]
-            
-            # Apply high-pass filter to remove DC offset (20 Hz cutoff)
-            cutoff = 20.0 / (self.config.sample_rate / 2)
-            b, a = cusignal.butter(2, cutoff, 'high')
-            brown = cusignal.lfilter(b, a, brown)
-            
-            return brown
+            return self._generate_brown_mono(white_noise)
         else:
-            # Stereo processing - apply to each channel
+            # Stereo processing - apply to each channel separately
             left = white_noise[0]
             right = white_noise[1]
             
-            # Process each channel separately
-            brown_left = self._generate_brown_noise(left)
-            brown_right = self._generate_brown_noise(right)
+            # Process each channel separately using the mono generator
+            brown_left = self._generate_brown_mono(left)
+            brown_right = self._generate_brown_mono(right)
             
             return cp.vstack((brown_left, brown_right))
     
@@ -547,6 +565,11 @@ class NoiseGenerator:
         self.is_cancelled = False
         
         start_time = time.time()
+        last_progress_update = time.time()
+        last_progress_value = 0.0
+        
+        # Determine throttle interval based on duration
+        progress_throttle = get_progress_throttle(self.config.duration)
         
         # Determine format based on extension
         _, ext = os.path.splitext(output_path)
@@ -622,10 +645,18 @@ class NoiseGenerator:
                 samples_written += write_length
                 samples_remaining -= write_length
                 
-                # Report progress
-                if self.progress_callback:
-                    progress_percent = (samples_written / self.total_samples) * 100
+                # Report progress with adaptive throttling
+                current_time = time.time()
+                progress_percent = (samples_written / self.total_samples) * 100
+                
+                # Check if enough time has passed OR progress has changed significantly
+                progress_change = abs(progress_percent - last_progress_value)
+                if (self.progress_callback and 
+                    ((current_time - last_progress_update >= progress_throttle) or 
+                     (progress_change >= 1.0))):  # Update at least every 1%
                     self.progress_callback(progress_percent)
+                    last_progress_update = current_time
+                    last_progress_value = progress_percent
         
         # Calculate processing metrics
         end_time = time.time()
@@ -671,6 +702,7 @@ class NoiseGenerator:
             logger.info(f"Output file metrics: {peak_db:.1f} dBFS peak, {lufs:.1f} LUFS")
         except Exception as e:
             logger.error(f"Error measuring output file: {e}")
+            result["error"] = f"Generated successfully, but encountered an error measuring the output: {str(e)}"
         
         return result
     
@@ -714,7 +746,12 @@ class StreamingNoiseGenerator:
     def _init_filters(self):
         """Initialize filters for pink and brown noise"""
         # Pink noise filter (shorter for real-time)
-        self._pink_filter_taps = self._create_pink_filter(2049)
+        self._pink_filter_taps = create_pink_filter(2049, self.config.sample_rate)
+        
+        # Precompute highpass filter coefficients for brown noise
+        cutoff = 20.0 / (self.config.sample_rate / 2)
+        # Use second-order sections form for better numerical stability
+        self._brown_hp_sos = cusignal.butter(2, cutoff, 'high', output='sos')
         
         # For stereo processing
         self.decorrelation_phases = None
@@ -728,31 +765,26 @@ class StreamingNoiseGenerator:
             phases = phases**2 / (cp.pi/4)  # Apply quadratic curve
             self.decorrelation_phases = cp.exp(1j * phases)
     
-    def _create_pink_filter(self, n_taps=2049):
-        """Create FIR filter for pink noise (simplified for streaming)"""
-        # Create frequency response for pink noise (-10 dB/decade falloff)
-        nyquist = self.config.sample_rate / 2
-        freqs = cp.linspace(0, nyquist, n_taps//2 + 1)
-        freqs[0] = freqs[1]  # Avoid division by zero
+    def _generate_brown_mono(self, white_noise):
+        """Generate brown noise from white noise for a single channel"""
+        # Create brown noise through integration with leaky factor
+        brown = cp.zeros_like(white_noise)
         
-        # Create pink spectrum (1/f)
-        response = 1.0 / cp.sqrt(freqs)
+        # Process in one large vectorized operation with efficient memory access
+        alpha = BROWN_LEAKY_ALPHA
+        scale = cp.sqrt(1.0 - alpha*alpha)  # Normalization factor
         
-        # Normalize
-        response = response / cp.max(response)
+        # First sample
+        brown[0] = scale * white_noise[0]
         
-        # Convert to filter taps using FFT
-        full_response = cp.concatenate([response, response[-2:0:-1]])
-        filter_taps = cp.real(cp.fft.ifft(full_response))
+        # Vectorized implementation using exponential decay
+        for i in range(1, len(white_noise)):
+            brown[i] = alpha * brown[i-1] + scale * white_noise[i]
         
-        # Window the filter
-        window = cp.hamming(len(filter_taps))
-        filter_taps = filter_taps * window
+        # Apply high-pass filter to remove DC offset using cached coefficients
+        brown = cusignal.lfilter(self._brown_hp_b, self._brown_hp_a, brown)
         
-        # Normalize for unity gain at DC
-        filter_taps = filter_taps / cp.sum(filter_taps)
-        
-        return filter_taps
+        return brown
     
     def _start_background_thread(self):
         """Start background thread for buffer generation"""
@@ -761,21 +793,37 @@ class StreamingNoiseGenerator:
         self.thread.start()
     
     def _buffer_generation_thread(self):
-        """Background thread to pre-generate buffers"""
+        """Background thread to pre-generate buffers with improved error handling"""
         while self.running:
-            if self.buffer_queue.qsize() < 2:
-                # Generate a new buffer
-                buffer_size = self.stream_buffer_size
-                noise_block = self._generate_buffer(buffer_size)
-                
-                try:
-                    self.buffer_queue.put(noise_block, block=False)
-                except queue.Full:
-                    # Queue is full, discard this buffer
-                    pass
-            else:
-                # Sleep to avoid busy waiting
-                time.sleep(0.01)
+            try:
+                if self.buffer_queue.qsize() < 2:
+                    # Generate a new buffer
+                    buffer_size = self.stream_buffer_size
+                    try:
+                        noise_block = self._generate_buffer(buffer_size)
+                        self.buffer_queue.put(noise_block, block=False)
+                    except Exception as e:
+                        # Log the error
+                        logger.error(f"Error generating buffer: {e}")
+                        # Generate silence as fallback
+                        if self.config.channels == 1:
+                            silence = np.zeros(buffer_size, dtype=np.float32)
+                        else:
+                            silence = np.zeros((buffer_size, 2), dtype=np.float32)
+                        
+                        # Try to put silence in the queue
+                        try:
+                            self.buffer_queue.put(silence, block=False)
+                        except queue.Full:
+                            pass  # Queue is full, just continue
+                else:
+                    # Sleep to avoid busy waiting
+                    time.sleep(0.01)
+            except Exception as e:
+                # Catch any other errors in the thread
+                logger.error(f"Error in buffer generation thread: {e}")
+                # Sleep briefly to avoid CPU thrashing if there's a persistent error
+                time.sleep(0.1)
     
     def _generate_buffer(self, buffer_size):
         """Generate a buffer of noise"""
@@ -796,45 +844,13 @@ class StreamingNoiseGenerator:
             pink_right = cusignal.fftconvolve(white_noise[1], self._pink_filter_taps, mode='same')
             pink_noise = cp.vstack((pink_left, pink_right))
         
-        # Generate brown noise
+        # Generate brown noise using the vectorized approach
         if self.config.channels == 1:
-            # Apply leaky integration
-            brown_noise = cp.zeros_like(white_noise)
-            alpha = BROWN_LEAKY_ALPHA
-            scale = cp.sqrt(1.0 - alpha*alpha)  # Normalization factor
-            
-            brown_noise[0] = scale * white_noise[0]
-            for i in range(1, len(white_noise)):
-                brown_noise[i] = alpha * brown_noise[i-1] + scale * white_noise[i]
-            
-            # Apply high-pass filter to remove DC offset
-            cutoff = 20.0 / (self.config.sample_rate / 2)
-            b, a = cusignal.butter(2, cutoff, 'high')
-            brown_noise = cusignal.lfilter(b, a, brown_noise)
+            brown_noise = self._generate_brown_mono(white_noise)
         else:
-            # Process each channel
-            brown_left = cp.zeros_like(white_noise[0])
-            brown_right = cp.zeros_like(white_noise[1])
-            
-            alpha = BROWN_LEAKY_ALPHA
-            scale = cp.sqrt(1.0 - alpha*alpha)
-            
-            # Process left channel
-            brown_left[0] = scale * white_noise[0][0]
-            for i in range(1, len(white_noise[0])):
-                brown_left[i] = alpha * brown_left[i-1] + scale * white_noise[0][i]
-            
-            # Process right channel
-            brown_right[0] = scale * white_noise[1][0]
-            for i in range(1, len(white_noise[1])):
-                brown_right[i] = alpha * brown_right[i-1] + scale * white_noise[1][i]
-            
-            # Apply high-pass filter
-            cutoff = 20.0 / (self.config.sample_rate / 2)
-            b, a = cusignal.butter(2, cutoff, 'high')
-            brown_left = cusignal.lfilter(b, a, brown_left)
-            brown_right = cusignal.lfilter(b, a, brown_right)
-            
+            # Process each channel separately using the mono generator
+            brown_left = self._generate_brown_mono(white_noise[0])
+            brown_right = self._generate_brown_mono(white_noise[1])
             brown_noise = cp.vstack((brown_left, brown_right))
         
         # Blend according to color mix
@@ -1042,13 +1058,12 @@ def warmth_to_color_mix(warmth):
         pink = 0.5 - 0.4 * t
         brown = 0.5 + 0.4 * t
     
-    # Normalize to sum to 1.0
-    total = white + pink + brown
-    return {
-        'white': white / total,
-        'pink': pink / total,
-        'brown': brown / total
-    }
+    # Use centralized normalization
+    return normalize_color_mix({
+        'white': white,
+        'pink': pink,
+        'brown': brown
+    })
 
 
 def generate_stereo_noise(config):
@@ -1534,6 +1549,11 @@ class BabyNoiseApp:
             self.stream.close()
             self.stream = None
         
+        # Shut down generator thread
+        if self.generator:
+            self.generator.shutdown()
+            self.generator = None
+        
         self.streaming = False
         self.play_button.configure(text="▶ Play")
         self.status_var.set("Ready - GPU Accelerated")
@@ -1571,12 +1591,8 @@ class BabyNoiseApp:
             'brown': self.brown_var.get()
         }
         
-        # Normalize to sum to 1.0
-        total = sum(color_mix.values())
-        if total > 0:
-            color_mix = {k: v / total for k, v in color_mix.items()}
-        else:
-            color_mix = {'white': 0.4, 'pink': 0.4, 'brown': 0.2}
+        # Normalize using the utility function
+        color_mix = normalize_color_mix(color_mix)
         
         # Get LFO rate if enabled
         lfo_rate = self.lfo_var.get() if self.lfo_enabled_var.get() else None
@@ -1700,6 +1716,12 @@ class BabyNoiseApp:
         """Called when rendering is complete"""
         self.render_button.configure(state=tk.NORMAL)
         
+        # Check for error in result
+        if result and "error" in result:
+            self.status_var.set(f"Error: {result['error']}")
+            messagebox.showerror("Render Warning", result["error"])
+            return
+        
         # Show real-time factor in status
         if result:
             real_time_factor = result.get('real_time_factor', 0)
@@ -1784,14 +1806,16 @@ class BabyNoiseApp:
         brown_y[x < 20] = -30
         
         # Mix according to color mix
-        total = self.white_var.get() + self.pink_var.get() + self.brown_var.get()
-        if total > 0:
-            mix_y = (self.white_var.get() * np.power(10, white_y/10) + 
-                    self.pink_var.get() * np.power(10, pink_y/10) + 
-                    self.brown_var.get() * np.power(10, brown_y/10)) / total
-            mix_y = 10 * np.log10(mix_y)
-        else:
-            mix_y = white_y
+        color_mix = normalize_color_mix({
+            'white': self.white_var.get(),
+            'pink': self.pink_var.get(),
+            'brown': self.brown_var.get()
+        })
+        
+        mix_y = (color_mix['white'] * np.power(10, white_y/10) + 
+                color_mix['pink'] * np.power(10, pink_y/10) + 
+                color_mix['brown'] * np.power(10, brown_y/10))
+        mix_y = 10 * np.log10(mix_y)
         
         # Update lines
         self.white_line.set_ydata(white_y)
@@ -1933,32 +1957,13 @@ class BabyNoiseApp:
         warmth = int(self.warmth_var.get())
         self.warmth_label.configure(text=f"{warmth}%")
         
-        # Map 0-100 warmth to color mix using improved mapping
-        warmth_frac = warmth / 100.0  # Convert to 0.0-1.0 range
-        
-        if warmth_frac < 0.33:
-            # 0-33%: Mostly white to equal white/pink
-            t = warmth_frac * 3  # 0-1
-            white = 1.0 - 0.5 * t
-            pink = 0.5 * t
-            brown = 0.0
-        elif warmth_frac < 0.67:
-            # 33-67%: Equal white/pink to equal pink/brown
-            t = (warmth_frac - 0.33) * 3  # 0-1
-            white = 0.5 - 0.5 * t
-            pink = 0.5
-            brown = 0.0 + 0.5 * t
-        else:
-            # 67-100%: Equal pink/brown to mostly brown
-            t = (warmth_frac - 0.67) * 3  # 0-1
-            white = 0.0
-            pink = 0.5 - 0.4 * t
-            brown = 0.5 + 0.4 * t
+        # Convert warmth to color mix using the utility function
+        color_mix = warmth_to_color_mix(warmth)
         
         # Update sliders without triggering their callbacks
-        self.white_var.set(white)
-        self.pink_var.set(pink)
-        self.brown_var.set(brown)
+        self.white_var.set(color_mix['white'])
+        self.pink_var.set(color_mix['pink'])
+        self.brown_var.set(color_mix['brown'])
         
         # Update visualization
         self.update_visualization()
@@ -1966,30 +1971,27 @@ class BabyNoiseApp:
     def on_color_change(self, event=None):
         """Handle manual color sliders change"""
         # Calculate warmth based on color mix
-        white_ratio = self.white_var.get()
-        pink_ratio = self.pink_var.get()
-        brown_ratio = self.brown_var.get()
+        color_mix = normalize_color_mix({
+            'white': self.white_var.get(),
+            'pink': self.pink_var.get(),
+            'brown': self.brown_var.get()
+        })
         
-        # Normalize to sum to 1.0
-        total = white_ratio + pink_ratio + brown_ratio
+        white_ratio = color_mix['white']
+        pink_ratio = color_mix['pink']
+        brown_ratio = color_mix['brown']
         
-        if total > 0:
-            # Normalize ratios
-            white_ratio /= total
-            pink_ratio /= total
-            brown_ratio /= total
+        # Calculate warmth (0-100)
+        if white_ratio > 0.99 and brown_ratio < 0.01:
+            warmth = 0  # All white
+        elif white_ratio < 0.01 and brown_ratio > 0.99:
+            warmth = 100  # All brown
+        else:
+            warmth = int((0.2 * pink_ratio + 0.8 * brown_ratio) * 100)
             
-            # Calculate warmth (0-100)
-            if white_ratio > 0.99 and brown_ratio < 0.01:
-                warmth = 0  # All white
-            elif white_ratio < 0.01 and brown_ratio > 0.99:
-                warmth = 100  # All brown
-            else:
-                warmth = int((0.2 * pink_ratio + 0.8 * brown_ratio) * 100)
-                
-            # Update warmth slider and label without triggering callback
-            self.warmth_var.set(warmth)
-            self.warmth_label.configure(text=f"{warmth}%")
+        # Update warmth slider and label without triggering callback
+        self.warmth_var.set(warmth)
+        self.warmth_label.configure(text=f"{warmth}%")
         
         # Update visualization
         self.update_visualization()
