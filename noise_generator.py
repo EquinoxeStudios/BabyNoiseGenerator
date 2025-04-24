@@ -131,8 +131,20 @@ def create_pink_filter(n_taps, sample_rate):
     response = response / cp.max(response)
     
     # Convert to filter taps using FFT
-    # Frequency sampling approach
-    full_response = cp.concatenate([response, response[-2:0:-1]])
+    # Make sure we get exactly n_taps total
+    if n_taps % 2 == 0:  # Even number of taps
+        full_response = cp.concatenate([response, response[-2:0:-1]])
+    else:  # Odd number of taps
+        full_response = cp.concatenate([response, response[-2::-1]])
+    
+    # Ensure exact length
+    if len(full_response) != n_taps:
+        # Pad or truncate to exact length
+        if len(full_response) < n_taps:
+            full_response = cp.pad(full_response, (0, n_taps - len(full_response)))
+        else:
+            full_response = full_response[:n_taps]
+    
     filter_taps = cp.real(cp.fft.ifft(full_response))
     
     # Window the filter to reduce Gibbs phenomenon
@@ -363,7 +375,8 @@ class NoiseGenerator:
             if peak > peak_threshold:
                 limiting_gain = peak_threshold / peak
                 noise_block = noise_block * limiting_gain
-                logger.info(f"Applied limiting: {20*cp.log10(limiting_gain):.1f} dB")
+                gain_db = float(20 * cp.log10(limiting_gain))
+                logger.info(f"Applied limiting: {gain_db:.1f} dB")
         else:
             # For stereo, process combined energy
             # Calculate RMS across both channels
@@ -385,7 +398,8 @@ class NoiseGenerator:
             if peak > peak_threshold:
                 limiting_gain = peak_threshold / peak
                 noise_block = noise_block * limiting_gain
-                logger.info(f"Applied limiting: {20*cp.log10(limiting_gain):.1f} dB")
+                gain_db = float(20 * cp.log10(limiting_gain))
+                logger.info(f"Applied limiting: {gain_db:.1f} dB")
         
         return noise_block
     
@@ -401,14 +415,15 @@ class NoiseGenerator:
             
             # Find true peak
             true_peak = cp.max(cp.abs(upsampled))
-            true_peak_db = 20 * cp.log10(true_peak + 1e-10)
+            true_peak_db = float(20 * cp.log10(true_peak + 1e-10))
             
             # Apply limiting if needed
             peak_threshold = 10 ** (peak_ceiling / 20.0)
             if true_peak > peak_threshold:
                 limiting_gain = peak_threshold / true_peak
                 noise_block = noise_block * limiting_gain
-                logger.info(f"Applied true-peak limiting: {20*cp.log10(limiting_gain):.1f} dB")
+                gain_db = float(20 * cp.log10(limiting_gain))
+                logger.info(f"Applied true-peak limiting: {gain_db:.1f} dB")
         else:
             # Stereo processing
             # Process each channel
@@ -419,14 +434,15 @@ class NoiseGenerator:
             true_peak_left = cp.max(cp.abs(upsampled_left))
             true_peak_right = cp.max(cp.abs(upsampled_right))
             true_peak = cp.maximum(true_peak_left, true_peak_right)
-            true_peak_db = 20 * cp.log10(true_peak + 1e-10)
+            true_peak_db = float(20 * cp.log10(true_peak + 1e-10))
             
             # Apply limiting if needed
             peak_threshold = 10 ** (peak_ceiling / 20.0)
             if true_peak > peak_threshold:
                 limiting_gain = peak_threshold / true_peak
                 noise_block = noise_block * limiting_gain
-                logger.info(f"Applied true-peak limiting: {20*cp.log10(limiting_gain):.1f} dB")
+                gain_db = float(20 * cp.log10(limiting_gain))
+                logger.info(f"Applied true-peak limiting: {gain_db:.1f} dB")
         
         return noise_block
     
@@ -578,8 +594,7 @@ class NoiseGenerator:
             subtype = None
         else:
             output_format = 'WAV'
-            # Determine bit depth
-            subtype = 'PCM_24'  # Default to 24-bit
+            subtype = 'PCM_24'  # Always 24-bit
         
         # Create output file
         with sf.SoundFile(
@@ -766,23 +781,17 @@ class StreamingNoiseGenerator:
             self.decorrelation_phases = cp.exp(1j * phases)
     
     def _generate_brown_mono(self, white_noise):
-        """Generate brown noise from white noise for a single channel"""
-        # Create brown noise through integration with leaky factor
-        brown = cp.zeros_like(white_noise)
-        
-        # Process in one large vectorized operation with efficient memory access
+        """Generate brown noise from white noise using vectorized IIR filtering"""
+        # Brown noise is an IIR filter: y[n] = alpha * y[n-1] + scale * x[n]
         alpha = BROWN_LEAKY_ALPHA
         scale = cp.sqrt(1.0 - alpha*alpha)  # Normalization factor
         
-        # First sample
-        brown[0] = scale * white_noise[0]
+        # Apply the filter (much faster than a Python loop)
+        # b=[scale], a=[1, -alpha] implements y[n]=alpha*y[n-1]+scale*x[n]
+        brown = cusignal.lfilter([scale], [1, -alpha], white_noise)
         
-        # Vectorized implementation using exponential decay
-        for i in range(1, len(white_noise)):
-            brown[i] = alpha * brown[i-1] + scale * white_noise[i]
-        
-        # Apply high-pass filter to remove DC offset using cached coefficients
-        brown = cusignal.lfilter(self._brown_hp_b, self._brown_hp_a, brown)
+        # Apply high-pass filter to remove DC offset using second-order sections
+        brown = cusignal.sosfilt(self._brown_hp_sos, brown)
         
         return brown
     
@@ -1344,7 +1353,7 @@ class BabyNoiseApp:
         
         ttk.Label(format_frame, text="Format:").pack(side=tk.LEFT, padx=5)
         ttk.Combobox(format_frame, textvariable=self.output_format_var, 
-                    values=["WAV (16-bit)", "WAV (24-bit)", "FLAC"]).pack(side=tk.LEFT, padx=5)
+                    values=["WAV (24-bit)", "FLAC"]).pack(side=tk.LEFT, padx=5)
         
         # Add GPU info label
         device_info = get_device_info()
@@ -1597,14 +1606,12 @@ class BabyNoiseApp:
         # Get LFO rate if enabled
         lfo_rate = self.lfo_var.get() if self.lfo_enabled_var.get() else None
         
-        # Determine output format and settings
+        # Determine output format 
         format_str = self.output_format_var.get()
-        if format_str == "WAV (16-bit)":
-            output_format = "PCM_16"
-        elif format_str == "WAV (24-bit)":
-            output_format = "PCM_24"
-        else:  # FLAC
+        if format_str == "FLAC":
             output_format = "FLAC"
+        else:  # WAV (24-bit)
+            output_format = "PCM_24"
         
         # Determine peak ceiling based on profile
         profile = self.profile_var.get()
@@ -1642,20 +1649,17 @@ class BabyNoiseApp:
         
         # Get output format
         format_str = self.output_format_var.get()
-        if format_str == "WAV (16-bit)" or format_str == "WAV (24-bit)":
-            extension = ".wav"
-        else:  # FLAC
+        if format_str == "FLAC":
             extension = ".flac"
-        
-        # Get bitrate info for filename
-        bitrate = "16bit" if format_str == "WAV (16-bit)" else "24bit"
+        else:  # WAV (24-bit)
+            extension = ".wav"
         
         # Channel info for filename
         channels = "mono" if self.channels_var.get() == 1 else "stereo"
         
         # Default filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_filename = f"baby_noise_{channels}_{bitrate}_{timestamp}{extension}"
+        default_filename = f"baby_noise_{channels}_24bit_{timestamp}{extension}"
         default_path = os.path.join(DEFAULT_OUTPUT_DIR, default_filename)
         
         # Ask for output path
@@ -1718,16 +1722,15 @@ class BabyNoiseApp:
         
         # Check for error in result
         if result and "error" in result:
-            self.status_var.set(f"Error: {result['error']}")
-            messagebox.showerror("Render Warning", result["error"])
-            return
+            self.status_var.set(f"Warning: {result['error']}")
+            messagebox.showwarning("Render Warning", result["error"])
         
         # Show real-time factor in status
         if result:
             real_time_factor = result.get('real_time_factor', 0)
             self.status_var.set(
                 f"Rendered to {os.path.basename(output_path)} "
-                f"({result['integrated_lufs']:.1f} LUFS, {result['peak_db']:.1f} dBFS peak, "
+                f"({result.get('integrated_lufs', 0):.1f} LUFS, {result.get('peak_db', 0):.1f} dBFS peak, "
                 f"{real_time_factor:.1f}x real-time)"
             )
         else:

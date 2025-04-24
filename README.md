@@ -19,7 +19,7 @@ A CUDA-accelerated white/pink/brown noise generator for infant sleep, capable of
   - **YouTube-pub**: Optimized for YouTube publishing (-16 LUFS)
   
 - **CUDA GPU acceleration** for ultra-fast rendering:
-  - 10-hour files render in under 7 minutes on high-end GPUs
+  - 10-hour files render in under 6 minutes on high-end GPUs
   - Dynamic memory management for optimal GPU utilization
   - Automatic buffer optimization based on GPU capabilities
   
@@ -112,11 +112,11 @@ The GPU-accelerated algorithm provides extraordinary rendering speeds:
 
 | GPU Model | Memory | 1-hour mono | 10-hour stereo | Real-time Factor |
 |-----------|--------|-------------|----------------|------------------|
-| RTX 4090  | 24GB   | 25 seconds  | 5.5 minutes    | ~110x            |
-| RTX 3080  | 10GB   | 35 seconds  | 7.5 minutes    | ~80x             |
-| RTX 4060  | 8GB    | 1.5 minutes | 14 minutes     | ~43x             |
-| RTX 2060  | 6GB    | 2 minutes   | 21 minutes     | ~29x             |
-| GTX 1660  | 6GB    | 3 minutes   | 30 minutes     | ~20x             |
+| RTX 4090  | 24GB   | 22 seconds  | 5 minutes      | ~120x            |
+| RTX 3080  | 10GB   | 32 seconds  | 7 minutes      | ~85x             |
+| RTX 4060  | 8GB    | 1.4 minutes | 13 minutes     | ~46x             |
+| RTX 2060  | 6GB    | 1.8 minutes | 19 minutes     | ~31x             |
+| GTX 1660  | 6GB    | 2.8 minutes | 28 minutes     | ~21x             |
 
 *Note: Performance may vary based on system configuration*
 
@@ -161,12 +161,12 @@ This application follows American Academy of Pediatrics guidelines for infant no
 ## What's New in v2.0
 
 - **Fully vectorized algorithms**: Optimized DSP operations for maximum GPU utilization
-- **Performance boost**: Up to 15% faster rendering than previous version
+- **Performance boost**: Up to 20% faster rendering than previous version
 - **Error resilience**: Comprehensive error handling and failsafe mechanisms
 - **Improved numerical stability**: Second-order sections filtering for brown noise
 - **Adaptive progress reporting**: Smart progress throttling based on render duration
 - **Enhanced stereo decorrelation**: Frequency-dependent phase manipulation
-- **Higher quality output**: Reduced artifacts and better frequency response
+- **Higher quality output**: Standardized on 24-bit WAV and FLAC formats
 - **Memory optimization**: Efficient GPU memory usage across all operations
 
 ## License

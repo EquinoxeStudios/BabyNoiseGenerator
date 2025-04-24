@@ -1,5 +1,48 @@
 # Changelog for Baby-Noise Generator
 
+## v2.0.0 (April 2025)
+
+### New Features
+- **GPU-only implementation**: Fully optimized for CUDA GPU processing
+- **Dynamic memory management**: Auto-optimizes for different GPU capabilities
+- **Enhanced stereo decorrelation**: Frequency-dependent phase manipulation
+- **Advanced true-peak limiting**: 4x oversampling for better peak detection
+- **Improved buffer handling**: Larger, optimized blocks for faster processing
+- **Real-time factor reporting**: Built-in benchmarking metrics
+
+### Performance Improvements
+- **Fully vectorized algorithms**: All DSP operations optimized for GPU execution
+- **Performance boost**: 15-20% faster rendering than previous version
+- **Second-order sections filtering**: Improved numerical stability for brown noise
+- **Adaptive progress reporting**: Smart throttling based on render duration
+- **Optimized memory layout**: Efficient GPU memory usage across all operations
+- **CuPy scalar conversions**: Proper handling of GPU arrays for numeric stability
+- **Optimal block sizes**: Dynamic adjustment based on available GPU memory
+
+### Technical Enhancements
+- **Thread safety enhancements**: Comprehensive exception handling in background threads
+- **Fallback mechanisms**: Silent output generation when errors occur
+- **Resource management**: Proper cleanup of threads and GPU resources
+- **Error propagation**: Improved feedback for file measurements and rendering issues
+- **Pink filter refinements**: Fixed off-by-one issues in filter tap generation
+- **Standardized output formats**: 24-bit WAV and FLAC for all exports
+- **Optimized filter caching**: Precomputed coefficients for improved performance
+
+### Bug Fixes
+- Fixed infinite recursion in stereo brown noise generation
+- Fixed streaming generator thread resource leaks
+- Fixed numerical errors in filter coefficient generation
+- Fixed CuPy array scalar formatting in log messages
+- Corrected inconsistent color mix normalization
+- Fixed memory leaks in long renders
+- Fixed potential crashes in stereo decorrelation
+
+### Documentation
+- Updated README with improved performance benchmarks
+- Added detailed technical outline of the GPU acceleration strategy
+- Improved inline code documentation for key algorithms
+- Updated system requirements
+
 ## v1.2.0 (April 2025)
 
 ### New Features
