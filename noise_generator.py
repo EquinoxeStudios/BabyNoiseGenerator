@@ -83,9 +83,9 @@ def cuda_stream():
     try:
         yield stream
     finally:
-        # Synchronize and destroy the stream when done
+        # Synchronize the stream when done (no destroy needed)
         stream.synchronize()
-        stream.destroy()
+        # CuPy streams don't have a destroy method - they're managed by Python's GC
 
 # Utility functions
 def get_device_info():
