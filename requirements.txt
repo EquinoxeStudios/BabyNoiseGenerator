@@ -1,12 +1,10 @@
-# Baby-Noise Generator v2.0 (GPU-Accelerated) - Requirements
+# Baby-Noise Generator v2.0 (GPU-Accelerated) - Requirements for Headless Operation
 
 # Core dependencies
 numpy>=1.20.0
 scipy>=1.7.0
 soundfile>=0.10.0
-sounddevice>=0.4.5
 pyyaml>=5.1.0
-matplotlib>=3.5.0  # For visualization
 
 # Required GPU acceleration (choose one based on your CUDA version)
 # For CUDA 11.x
@@ -14,10 +12,6 @@ matplotlib>=3.5.0  # For visualization
 
 # For CUDA 12.x (recommended)
 cupy-cuda12x>=12.2.0
-
-# GUI requirements
-# Note: Most Python installations include tkinter by default
-tk>=0.1.0  # For the GUI interface
 
 # Optional enhancements (uncomment if needed)
 # pyloudnorm>=0.1.0  # For ITU-R BS.1770-4 compliant LUFS measurements

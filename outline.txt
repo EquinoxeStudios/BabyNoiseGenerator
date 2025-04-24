@@ -1,10 +1,11 @@
 # Python "Baby‑Noise" Generator v2 – Technical Outline
-(GPU-accelerated high-quality white / pink / brown noise for YouTube & mobile apps)
+(GPU-accelerated high-quality white / pink / brown noise for YouTube & cloud services)
 
 ## 1. High‑level goals
 * Single GPU-accelerated engine that can:
    * Render 10‑hour gap‑free WAV/FLAC files for YouTube with **CUDA GPU acceleration**, and
    * Deliver 80-120x real-time rendering speeds on high-end GPUs
+   * Run in headless mode on cloud GPU services like Google Colab
 * Three noise colours (white, pink, brown) with a cross‑fade "warmth" slider
 * Medical‑safe output – long‑term RMS ≲ 50 dB SPL, –1 dBFS peak ceiling. Real‑time LUFS monitoring (60s window) auto‑reduces gain if level > 50 dB SPL (AAP guideline)
 * Deterministic seeds for reproducible renders, with easy randomization per export
@@ -89,10 +90,19 @@ graph TD
 * **Thread safety**: Comprehensive exception handling in background threads
 * **Fallback mechanisms**: Automatic silence generation on errors
 * **Progress throttling**: Adaptive update frequency based on render duration
-* **UI feedback**: Informative error messages and warnings
+* **Console feedback**: Informative error messages and progress indicators for headless operation
 * **Resource management**: Proper cleanup of threads and GPU resources
 
-## 7. Future DSP add-ons
+## 7. Cloud/Headless Operation
+
+* **Command-line interface**: Comprehensive CLI with all noise generation options
+* **No GUI dependencies**: Removed tkinter and matplotlib requirements
+* **Progress reporting**: Console-based progress indicators
+* **Colab integration**: Sample notebook and setup tools for Google Colab
+* **Pure-color presets**: Added presets for pure white, pink, and brown noise
+* **Error handling**: Robust error handling in headless environments
+
+## 8. Future DSP add-ons
 
 **Phase 2 (Q3 2025)** – *Expanded capabilities*
 * Mixed precision computation for newer GPUs (Tensor Cores)

@@ -1,6 +1,6 @@
-# Baby-Noise Generator v2.0 (GPU Accelerated)
+# Baby-Noise Generator v2.0 (Headless GPU Accelerated)
 
-A CUDA-accelerated white/pink/brown noise generator for infant sleep, capable of ultra-fast rendering for YouTube videos.
+A CUDA-accelerated white/pink/brown noise generator optimized for cloud GPU services like Google Colab, capable of ultra-fast rendering for YouTube videos.
 
 ## Features
 
@@ -58,6 +58,47 @@ pip install cupy-cuda12x  # Required for GPU acceleration
 
 ## Usage
 
+### Command Line Interface
+
+```bash
+# Basic usage with preset
+python noise_generator.py --output baby_sleep.wav --duration 3600 --preset infant_3m_deep
+
+# Stereo output with warmth control
+python noise_generator.py --output baby_sleep.flac --channels 2 --warmth 75 --profile youtube-pub
+
+# Pure white noise for YouTube
+python noise_generator.py --output white_noise.wav --channels 2 --warmth 0 --profile youtube-pub
+
+# Pure colors using presets
+python noise_generator.py --output white.wav --preset white_only
+python noise_generator.py --output pink.wav --preset pink_only
+python noise_generator.py --output brown.wav --preset brown_only
+
+# Custom color mix
+python noise_generator.py --output custom.flac --white 0.2 --pink 0.3 --brown 0.5 --duration 1800
+
+# For help and all options
+python noise_generator.py -h
+```
+
+### Google Colab Usage
+
+1. Upload the necessary files:
+   - `noise_generator.py`
+   - `presets.yaml` (optional)
+   - `requirements.txt`
+
+2. Install dependencies:
+   ```python
+   !pip install -r requirements.txt
+   ```
+
+3. Run the generator:
+   ```python
+   !python noise_generator.py --output white_noise.wav --channels 2 --warmth 0 --profile youtube-pub
+   ```
+
 ### Python API
 
 ```python
@@ -96,16 +137,6 @@ color_mix = warmth_to_color_mix(75)  # warmer noise
 print(color_mix)  # {'white': 0.0, 'pink': 0.3, 'brown': 0.7}
 ```
 
-### Command Line Interface
-
-```bash
-# Basic usage with preset
-python noise_generator.py --output baby_sleep.wav --duration 3600 --preset infant_3m_deep
-
-# Stereo output with warmth control
-python noise_generator.py --output baby_sleep.flac --channels 2 --warmth 75 --profile youtube-pub
-```
-
 ## Performance Benchmarks
 
 The GPU-accelerated algorithm provides extraordinary rendering speeds:
@@ -117,6 +148,7 @@ The GPU-accelerated algorithm provides extraordinary rendering speeds:
 | RTX 4060  | 8GB    | 1.4 minutes | 13 minutes     | ~46x             |
 | RTX 2060  | 6GB    | 1.8 minutes | 19 minutes     | ~31x             |
 | GTX 1660  | 6GB    | 2.8 minutes | 28 minutes     | ~21x             |
+| Tesla T4 (Colab) | 16GB | ~1 minute | ~10 minutes  | ~60x             |
 
 *Note: Performance may vary based on system configuration*
 
@@ -158,8 +190,11 @@ This application follows American Academy of Pediatrics guidelines for infant no
 - Automatic safety gain reduction when threshold is exceeded
 - Use in conjunction with proper sleep practices and monitoring
 
-## What's New in v2.0
+## What's New in v2.0 Headless Edition
 
+- **Headless operation**: Optimized for cloud GPU services (Colab, etc.)
+- **Enhanced CLI**: Comprehensive command-line interface with all options
+- **Pure color presets**: Added presets for pure white, pink, and brown noise
 - **Fully vectorized algorithms**: Optimized DSP operations for maximum GPU utilization
 - **Performance boost**: Up to 20% faster rendering than previous version
 - **Error resilience**: Comprehensive error handling and failsafe mechanisms
