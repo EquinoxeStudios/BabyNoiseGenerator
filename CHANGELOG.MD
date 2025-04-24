@@ -1,5 +1,11 @@
 # Changelog for Baby-Noise Generator
 
+## v2.0.1 (April 2025)
+
+### Bug Fixes
+- **Device Name Handling**: Fixed CUDA device name decoding to properly handle both string and byte formats
+- **Code Cleanup**: Removed unused parameter from render thread implementation
+
 ## v2.0.0 (April 2025)
 
 ### New Features

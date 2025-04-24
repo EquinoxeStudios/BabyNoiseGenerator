@@ -90,8 +90,13 @@ def get_device_info():
         device_id = cp.cuda.device.get_device_id()
         device_props = cp.cuda.runtime.getDeviceProperties(device_id)
         
+        # Properly handle name that could be bytes or string
+        name = device_props["name"]
+        if isinstance(name, (bytes, bytearray)):
+            name = name.decode()
+        
         _device_info_cache = {
-            "name": device_props["name"].decode(),
+            "name": name,
             "compute_capability": f"{device_props['major']}.{device_props['minor']}",
             "total_memory": device_props["totalGlobalMem"] / (1024**3),  # GB
             "multiprocessors": device_props["multiProcessorCount"],
@@ -1678,7 +1683,7 @@ class BabyNoiseApp:
             return
         
         # Create config
-        config, output_format = self.create_config()
+        config, _ = self.create_config()
         
         # Update status and disable render button
         self.status_var.set(f"Rendering to {os.path.basename(output_path)}... (GPU Accelerated)")
@@ -1692,16 +1697,13 @@ class BabyNoiseApp:
         # Start rendering in a separate thread
         threading.Thread(
             target=self._render_thread,
-            args=(generator, output_path, output_format),
+            args=(generator, output_path),
             daemon=True
         ).start()
     
-    def _render_thread(self, generator, output_path, output_format):
+    def _render_thread(self, generator, output_path):
         """Background thread for rendering"""
         try:
-            # Get file extension
-            _, ext = os.path.splitext(output_path)
-            
             # Update status (on main thread) with correct extension
             self.root.after(0, lambda: self.status_var.set(
                 f"Rendering to {os.path.basename(output_path)}... (GPU Accelerated)"
