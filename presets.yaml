@@ -1,5 +1,5 @@
 # Baby-Noise Generator v2.0.2 Enhanced DSP Edition - Presets
-# Phase-based noise presets for different infant sleep stages
+# Stereo-optimized presets for different infant sleep stages
 # Note: American Academy of Pediatrics (AAP) recommends levels below -60 dBFS (~50 dB SPL)
 
 presets:
@@ -133,3 +133,20 @@ presets:
     natural_modulation: true   # Enable organic modulation
     haas_effect: true          # Enable Haas effect
     enhanced_stereo: true      # Enable enhanced stereo
+
+  # YouTube-optimized stereo enhancement presets
+  youtube_cinematic:
+    color_mix: {white: 0.1, pink: 0.3, brown: 0.6}
+    rms_target: -18.0  # Slightly louder for YouTube
+    lfo_rate: 0.07     # Subtle modulation
+    natural_modulation: true
+    haas_effect: true   
+    enhanced_stereo: true
+    
+  youtube_widescape:
+    color_mix: {white: 0.2, pink: 0.5, brown: 0.3}
+    rms_target: -19.0  # YouTube standard level
+    lfo_rate: 0.1      # Hz
+    natural_modulation: true
+    haas_effect: true
+    enhanced_stereo: true

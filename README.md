@@ -1,6 +1,6 @@
 # Baby-Noise Generator v2.0.2 (Enhanced DSP Edition)
 
-A CUDA-accelerated white/pink/brown noise generator with advanced DSP optimized for cloud GPU services, capable of ultra-fast rendering with exceptional sound quality.
+A CUDA-accelerated stereo noise generator with advanced DSP optimized for cloud GPU services, capable of ultra-fast rendering with exceptional sound quality. Designed specifically for creating high-quality YouTube baby sleep noise content.
 
 ## Features
 
@@ -12,7 +12,7 @@ A CUDA-accelerated white/pink/brown noise generator with advanced DSP optimized 
 - **Advanced stereo processing**:
   - Frequency-dependent phase decorrelation for natural stereo field
   - Haas-effect enhancement with bass protection
-  - Enhanced spatial imaging for headphones or multi-speaker setups
+  - Enhanced spatial imaging optimized for YouTube playback
   
 - **Natural sound modulation**:
   - Subtle multi-band modulation for more organic sound
@@ -32,12 +32,13 @@ A CUDA-accelerated white/pink/brown noise generator with advanced DSP optimized 
   - Psychoacoustically-optimized soft-knee compression
   - True-peak limiting with 4x oversampling
   - Logarithmic-domain processing for better numerical stability
-  - LUFS-style loudness monitoring
+  - BS.1770-4 compliant LUFS loudness metering
   
 - **Presets for different ages and sleep stages**:
   - Enhanced presets with organic, spatial, and warm variations
   - Age-specific presets (newborn, infant, toddler)
   - Sleep stage presets (deep sleep, light sleep)
+  - YouTube-optimized stereo enhancement presets
   
 - **Advanced features**:
   - Deterministic seeds for reproducible renders using Philox PRNG
@@ -67,16 +68,20 @@ pip install cupy-cuda12x  # Required for GPU acceleration
 # Basic usage with preset
 python noise_generator.py --output baby_sleep.wav --duration 3600 --preset infant_3m_deep
 
-# Stereo output with enhanced features
-python noise_generator.py --output baby_sleep.flac --channels 2 --warmth 75 --profile youtube-pub --natural-mod --haas --enhanced-stereo
+# Enhanced features
+python noise_generator.py --output baby_sleep.flac --warmth 75 --profile youtube-pub --natural-mod --haas --enhanced-stereo
 
 # Pure white noise for YouTube
-python noise_generator.py --output white_noise.wav --channels 2 --warmth 0 --profile youtube-pub
+python noise_generator.py --output white_noise.wav --warmth 0 --profile youtube-pub
 
 # Enhanced presets
 python noise_generator.py --output enhanced_organic.wav --preset enhanced_organic
 python noise_generator.py --output enhanced_spatial.wav --preset enhanced_spatial
 python noise_generator.py --output enhanced_warm.wav --preset enhanced_warm
+
+# YouTube-optimized stereo presets
+python noise_generator.py --output youtube_cinematic.wav --preset youtube_cinematic
+python noise_generator.py --output youtube_widescape.wav --preset youtube_widescape
 
 # Pure colors using presets
 python noise_generator.py --output white.wav --preset white_only
@@ -104,7 +109,7 @@ python noise_generator.py -h
 
 3. Run the generator:
    ```python
-   !python noise_generator.py --output white_noise.wav --channels 2 --warmth 0 --profile youtube-pub
+   !python noise_generator.py --output white_noise.wav --warmth 0 --profile youtube-pub
    ```
 
 ### Python API
@@ -121,7 +126,6 @@ config = NoiseConfig(
     peak_ceiling=-3.0,
     lfo_rate=0.1,  # gentle modulation
     sample_rate=44100,
-    channels=2,    # stereo output
     profile="baby-safe",
     natural_modulation=True,  # enable organic sound
     haas_effect=True,         # enable Haas effect
@@ -152,13 +156,13 @@ print(color_mix)  # {'white': 0.0, 'pink': 0.3, 'brown': 0.7}
 
 The enhanced GPU-accelerated algorithm provides extraordinary rendering speeds:
 
-| GPU Model | Memory | 1-hour mono | 10-hour stereo | Real-time Factor |
-|-----------|--------|-------------|----------------|------------------|
-| RTX 4090  | 24GB   | 20 seconds  | 4.5 minutes    | ~130x            |
-| RTX 3080  | 10GB   | 30 seconds  | 6.5 minutes    | ~92x             |
-| RTX 4060  | 8GB    | 1.3 minutes | 12 minutes     | ~50x             |
-| RTX 2060  | 6GB    | 1.7 minutes | 18 minutes     | ~33x             |
-| GTX 1660  | 6GB    | 2.5 minutes | 25 minutes     | ~24x             |
+| GPU Model | Memory | 1-hour stereo | 10-hour stereo | Real-time Factor |
+|-----------|--------|---------------|----------------|------------------|
+| RTX 4090  | 24GB   | 20 seconds    | 4.5 minutes    | ~130x            |
+| RTX 3080  | 10GB   | 30 seconds    | 6.5 minutes    | ~92x             |
+| RTX 4060  | 8GB    | 1.3 minutes   | 12 minutes     | ~50x             |
+| RTX 2060  | 6GB    | 1.7 minutes   | 18 minutes     | ~33x             |
+| GTX 1660  | 6GB    | 2.5 minutes   | 25 minutes     | ~24x             |
 | Tesla T4 (Colab) | 16GB | ~55 seconds | ~9 minutes | ~65x            |
 
 *Note: Performance may vary based on system configuration*
@@ -221,13 +225,15 @@ This application follows American Academy of Pediatrics guidelines for infant no
 
 ## What's New in v2.0.2 Enhanced DSP Edition
 
+- **Stereo-only implementation**: Streamlined code focused exclusively on stereo output
 - **Enhanced DSP algorithms**: Improved sound quality with advanced processing techniques
 - **Frequency-dependent stereo**: Better stereo imaging with no phase issues in bass
 - **Natural sound modulation**: Subtle organic modulation for a more natural listening experience
-- **Haas effect enhancement**: Improved spatial imaging for headphones
+- **Haas effect enhancement**: Improved spatial imaging for headphones and speakers
 - **Improved warmth control**: Psychoacoustically optimized warmth parameter curve
 - **Multi-stage dynamics**: Better compression and limiting algorithms for smoother sound
-- **Optimized presets**: New enhanced presets for different listening scenarios
+- **YouTube-optimized presets**: New presets designed specifically for YouTube publishing
+- **Accurate LUFS measurement**: ITU-R BS.1770-4 compliant loudness measurement
 - **Numerical improvements**: Better filter design and implementation for higher accuracy
 - **Precision control**: Dynamic precision selection based on render duration
 - **Enhanced error handling**: More robust processing for long renders

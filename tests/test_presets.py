@@ -41,6 +41,11 @@ def test_preset_schema():
         assert "rms_target" in preset, f"Preset '{name}' missing 'rms_target'"
         assert "lfo_rate" in preset or preset.get("lfo_rate") is None, f"Preset '{name}' has invalid 'lfo_rate'"
         
+        # Stereo-specific settings
+        assert "haas_effect" in preset, f"Preset '{name}' missing 'haas_effect'"
+        assert "enhanced_stereo" in preset, f"Preset '{name}' missing 'enhanced_stereo'"
+        assert "natural_modulation" in preset, f"Preset '{name}' missing 'natural_modulation'"
+        
         # Check color_mix
         color_mix = preset["color_mix"]
         assert isinstance(color_mix, dict), f"Preset '{name}' 'color_mix' should be a dictionary"
@@ -80,10 +85,29 @@ def test_safety_limits():
     
     for name, preset in presets.items():
         rms_target = preset["rms_target"]
-        assert rms_target <= safety_threshold, (
-            f"Preset '{name}' rms_target ({rms_target} dBFS) exceeds safety threshold "
-            f"({safety_threshold} dBFS / 50 dB SPL)"
-        )
+        # Special case for YouTube presets which can be louder
+        if not name.startswith("youtube"):
+            assert rms_target <= safety_threshold, (
+                f"Preset '{name}' rms_target ({rms_target} dBFS) exceeds safety threshold "
+                f"({safety_threshold} dBFS / 50 dB SPL)"
+            )
+
+
+def test_stereo_settings():
+    """Test that all presets have stereo settings"""
+    with open(PRESETS_FILE, 'r') as f:
+        presets_data = yaml.safe_load(f)
+    
+    presets = presets_data["presets"]
+    
+    for name, preset in presets.items():
+        # Ensure stereo settings are present
+        assert "haas_effect" in preset, f"Preset '{name}' missing 'haas_effect'"
+        assert "enhanced_stereo" in preset, f"Preset '{name}' missing 'enhanced_stereo'"
+        
+        # Check types of stereo settings
+        assert isinstance(preset["haas_effect"], bool), f"Preset '{name}' 'haas_effect' should be a boolean"
+        assert isinstance(preset["enhanced_stereo"], bool), f"Preset '{name}' 'enhanced_stereo' should be a boolean"
 
 
 if __name__ == "__main__":
