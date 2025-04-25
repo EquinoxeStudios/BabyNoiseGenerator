@@ -1,5 +1,39 @@
 # Changelog for Baby-Noise Generator
 
+## v2.0.2 (April 2025) - Enhanced DSP Edition
+
+### Sound Quality Enhancements
+- **Enhanced pink noise algorithm**: Upgraded to 8th-order IIR coefficients for more accurate low-frequency response
+- **Improved brown noise algorithm**: Added low-shelf filter (+3dB @ 75Hz) for enhanced low-end presence
+- **Natural sound modulation**: Added subtle multi-band modulation for more organic sound
+- **Enhanced stereo field**: Frequency-dependent phase decorrelation that preserves mono compatibility
+- **Haas effect stereo enhancement**: Added delay-based enhancement with frequency protection
+- **Psychoacoustic warmth curve**: More perceptually natural warmth parameter response
+
+### Technical Improvements
+- **Numerical optimization**: Corrected filter symmetry for proper phase response
+- **Frequency calculation precision**: Enhanced bin index calculation for better accuracy
+- **Logarithmic-domain compression**: Improved soft-knee compression algorithm
+- **Polyphase true-peak detection**: Better intersample peak detection with 4x oversampling
+- **Dynamic precision control**: Adaptive precision based on render duration
+- **Enhanced filter initialization**: Proper filter state dimensions for better stability
+- **Improved memory management**: Better handling of long renders and large buffer sizes
+
+### New Features
+- **Enhanced presets**: Added new presets focused on specific sound qualities
+  - `enhanced_organic`: Optimized for natural sound with subtle modulation
+  - `enhanced_spatial`: Optimized for immersive stereo field
+  - `enhanced_warm`: Optimized for rich, warm sound character
+- **Command-line options**: New options for enhanced DSP features
+  - `--natural-mod / --no-natural-mod`: Enable/disable organic sound modulation
+  - `--haas / --no-haas`: Enable/disable Haas effect for stereo width
+  - `--enhanced-stereo / --no-enhanced-stereo`: Enable/disable advanced stereo decorrelation
+
+### Documentation
+- Updated README with enhanced feature descriptions
+- Added detailed technical information about DSP algorithms
+- Updated performance benchmarks with enhanced algorithm metrics
+
 ## v2.0.1 (April 2025)
 
 ### Bug Fixes

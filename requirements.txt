@@ -1,4 +1,4 @@
-# Baby-Noise Generator v2.0 (GPU-Accelerated) - Requirements for Headless Operation
+# Baby-Noise Generator v2.0.2 (Enhanced DSP Edition) - Requirements for Headless Operation
 
 # Core dependencies
 numpy>=1.20.0
@@ -15,3 +15,4 @@ cupy-cuda12x>=12.2.0
 
 # Optional enhancements (uncomment if needed)
 # pyloudnorm>=0.1.0  # For ITU-R BS.1770-4 compliant LUFS measurements
+# matplotlib>=3.5.0  # For visualization and analysis (during development)
