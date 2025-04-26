@@ -1,75 +1,10 @@
 # Baby-Noise Generator v2.0.2 Enhanced DSP Edition - Presets
-# Stereo-optimized presets for different infant sleep stages
-# Note: American Academy of Pediatrics (AAP) recommends levels below -60 dBFS (~50 dB SPL)
+# Stereo-optimized presets for YouTube content
 
 presets:
-  newborn_deep:
-    color_mix: {white: 0.15, pink: 0.3, brown: 0.55}
-    rms_target: -65.0  # ~45 dB SPL
-    lfo_rate: 0.05     # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
-  
-  newborn_light:
-    color_mix: {white: 0.35, pink: 0.4, brown: 0.25}
-    rms_target: -63.0  # ~47 dB SPL
-    lfo_rate: 0.1      # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
-  
-  infant_3m_deep:
-    color_mix: {white: 0.25, pink: 0.45, brown: 0.3}
-    rms_target: -64.0  # ~46 dB SPL
-    lfo_rate: 0.08     # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
-    
-  infant_3m_light:
-    color_mix: {white: 0.45, pink: 0.35, brown: 0.2}
-    rms_target: -62.0  # ~48 dB SPL
-    lfo_rate: 0.12     # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
-    
-  infant_6m_deep:
-    color_mix: {white: 0.35, pink: 0.45, brown: 0.2}
-    rms_target: -63.0  # ~47 dB SPL
-    lfo_rate: 0.1      # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
-    
-  infant_6m_light:
-    color_mix: {white: 0.55, pink: 0.35, brown: 0.1}
-    rms_target: -61.0  # ~49 dB SPL
-    lfo_rate: 0.15     # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
-    
-  toddler_deep:
-    color_mix: {white: 0.45, pink: 0.35, brown: 0.2}
-    rms_target: -62.0  # ~48 dB SPL
-    lfo_rate: 0.12     # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
-    
-  toddler_light:
-    color_mix: {white: 0.65, pink: 0.25, brown: 0.1}
-    rms_target: -60.0  # ~50 dB SPL (at AAP recommended limit)
-    lfo_rate: 0.18     # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
-    
   default:
     color_mix: {white: 0.4, pink: 0.4, brown: 0.2}
-    rms_target: -63.0  # ~47 dB SPL
+    rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
     natural_modulation: true
     haas_effect: true
@@ -78,7 +13,7 @@ presets:
   # Pure color presets
   white_only:
     color_mix: {white: 1.0, pink: 0.0, brown: 0.0}
-    rms_target: -63.0  # ~47 dB SPL
+    rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
     natural_modulation: false  # Disable for pure spectral characteristic
     haas_effect: true
@@ -86,7 +21,7 @@ presets:
     
   pink_only:
     color_mix: {white: 0.0, pink: 1.0, brown: 0.0}
-    rms_target: -63.0  # ~47 dB SPL
+    rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
     natural_modulation: false  # Disable for pure spectral characteristic
     haas_effect: true
@@ -94,7 +29,7 @@ presets:
     
   brown_only:
     color_mix: {white: 0.0, pink: 0.0, brown: 1.0}
-    rms_target: -63.0  # ~47 dB SPL
+    rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
     natural_modulation: false  # Disable for pure spectral characteristic
     haas_effect: true
@@ -112,7 +47,7 @@ presets:
   # Special presets for enhanced features
   enhanced_organic:
     color_mix: {white: 0.3, pink: 0.5, brown: 0.2}
-    rms_target: -63.0  # ~47 dB SPL
+    rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
     natural_modulation: true   # Enable organic modulation
     haas_effect: true          # Enable Haas effect
@@ -120,7 +55,7 @@ presets:
   
   enhanced_spatial:
     color_mix: {white: 0.2, pink: 0.5, brown: 0.3}
-    rms_target: -63.0  # ~47 dB SPL
+    rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.08     # Hz
     natural_modulation: true   # Enable organic modulation
     haas_effect: true          # Enable Haas effect
@@ -128,7 +63,7 @@ presets:
   
   enhanced_warm:
     color_mix: {white: 0.1, pink: 0.4, brown: 0.5}
-    rms_target: -64.0  # ~46 dB SPL
+    rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.06     # Hz
     natural_modulation: true   # Enable organic modulation
     haas_effect: true          # Enable Haas effect

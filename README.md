@@ -1,6 +1,6 @@
 # Baby-Noise Generator v2.0.2 (Enhanced DSP Edition)
 
-A CUDA-accelerated stereo noise generator with advanced DSP optimized for cloud GPU services, capable of ultra-fast rendering with exceptional sound quality. Designed specifically for creating high-quality YouTube baby sleep noise content.
+A CUDA-accelerated stereo noise generator with advanced DSP optimized for cloud GPU services, capable of ultra-fast rendering with exceptional sound quality. Designed specifically for creating high-quality YouTube sleep noise content.
 
 ## Features
 
@@ -19,9 +19,11 @@ A CUDA-accelerated stereo noise generator with advanced DSP optimized for cloud 
   - Frequency-dependent processing with phase offsets between channels
   - Removes the "static" quality found in synthetic noise
   
-- **Two output profiles**:
-  - **Baby-safe**: AAP-compliant levels (~47 dB SPL)
-  - **YouTube-pub**: Optimized for YouTube publishing (-16 LUFS)
+- **YouTube-optimized output**:
+  - 48 kHz sample rate (matches YouTube's processing pipeline)
+  - Optimized for YouTube and other streaming platforms (-16 LUFS)
+  - High-frequency pre-emphasis for codec resilience
+  - True-peak ceiling: -2 dBTP
   
 - **CUDA GPU acceleration** for ultra-fast rendering:
   - 10-hour files render in under 5 minutes on high-end GPUs
@@ -34,10 +36,9 @@ A CUDA-accelerated stereo noise generator with advanced DSP optimized for cloud 
   - Logarithmic-domain processing for better numerical stability
   - BS.1770-4 compliant LUFS loudness metering
   
-- **Presets for different ages and sleep stages**:
+- **Presets for different sound characteristics**:
   - Enhanced presets with organic, spatial, and warm variations
-  - Age-specific presets (newborn, infant, toddler)
-  - Sleep stage presets (deep sleep, light sleep)
+  - Pure color presets (white only, pink only, brown only)
   - YouTube-optimized stereo enhancement presets
   
 - **Advanced features**:
@@ -65,14 +66,14 @@ pip install cupy-cuda12x  # Required for GPU acceleration
 ### Command Line Interface
 
 ```bash
-# Basic usage with preset
-python noise_generator.py --output baby_sleep.wav --duration 3600 --preset infant_3m_deep
+# Basic usage
+python noise_generator.py --output youtube_noise.wav --duration 3600
 
 # Enhanced features
-python noise_generator.py --output baby_sleep.flac --warmth 75 --profile youtube-pub --natural-mod --haas --enhanced-stereo
+python noise_generator.py --output youtube_noise.flac --warmth 75 --natural-mod --haas --enhanced-stereo
 
-# Pure white noise for YouTube
-python noise_generator.py --output white_noise.wav --warmth 0 --profile youtube-pub
+# Pure white noise
+python noise_generator.py --output white_noise.wav --warmth 0
 
 # Enhanced presets
 python noise_generator.py --output enhanced_organic.wav --preset enhanced_organic
@@ -109,7 +110,7 @@ python noise_generator.py -h
 
 3. Run the generator:
    ```python
-   !python noise_generator.py --output white_noise.wav --warmth 0 --profile youtube-pub
+   !python noise_generator.py --output white_noise.wav --warmth 0
    ```
 
 ### Python API
@@ -122,11 +123,10 @@ config = NoiseConfig(
     seed=12345,
     duration=600,  # 10 minutes
     color_mix={'white': 0.3, 'pink': 0.4, 'brown': 0.3},
-    rms_target=-63.0,
-    peak_ceiling=-3.0,
+    rms_target=-20.0,
+    peak_ceiling=-2.0,
     lfo_rate=0.1,  # gentle modulation
-    sample_rate=44100,
-    profile="baby-safe",
+    sample_rate=48000,  # YouTube-optimized sample rate
     natural_modulation=True,  # enable organic sound
     haas_effect=True,         # enable Haas effect
     enhanced_stereo=True      # enable advanced stereo decorrelation
@@ -167,25 +167,13 @@ The enhanced GPU-accelerated algorithm provides extraordinary rendering speeds:
 
 *Note: Performance may vary based on system configuration*
 
-## Output Profiles
+## YouTube Output Optimization
 
-### Baby-safe Profile
-
-- Follows American Academy of Pediatrics guidelines for infant noise exposure
-- Default RMS level: -63 dBFS (~47 dB SPL)
-- LUFS threshold: -27 LUFS
-- True-peak ceiling: -3 dBTP
-- Includes automatic safety monitoring and gain reduction
-- Recommended for all infant sleep applications
-
-### YouTube-pub Profile
-
-- Optimized for YouTube and other streaming platforms
-- RMS level: -20 dBFS (~-16 LUFS)
-- LUFS threshold: -16 LUFS
-- True-peak ceiling: -2 dBTP
-- Includes high-frequency pre-emphasis for codec resilience
-- **NOT recommended for infant sleep** - use only for publishing
+- **Optimized for YouTube and other streaming platforms**
+- **RMS level**: -20 dBFS (~-16 LUFS)
+- **LUFS threshold**: -16 LUFS
+- **True-peak ceiling**: -2 dBTP
+- **High-frequency pre-emphasis**: Improves codec resilience for better YouTube quality
 
 ## Enhanced DSP Features
 
@@ -214,14 +202,6 @@ The enhanced GPU-accelerated algorithm provides extraordinary rendering speeds:
 - **LUFS Monitoring**: ITU-R BS.1770-4 compliant loudness measurement
 - **True-peak Detection**: 4x oversampling with high-quality interpolation
 - **Stereo Generation**: Frequency-dependent phase decorrelation with Haas enhancement
-
-## Medical Safety
-
-This application follows American Academy of Pediatrics guidelines for infant noise exposure:
-- Default levels are set to ~47 dB SPL (well below the 50 dB SPL recommendation)
-- LUFS monitoring ensures consistent loudness across devices
-- Automatic safety gain reduction when threshold is exceeded
-- Use in conjunction with proper sleep practices and monitoring
 
 ## What's New in v2.0.2 Enhanced DSP Edition
 
