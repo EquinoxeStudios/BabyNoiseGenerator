@@ -252,22 +252,17 @@ def create_brown_filters(sample_rate):
         # Try creating the filter with cusignal
         sos_hp = cusignal.butter(2, cutoff_hp, 'high', output='sos')
         
-        # CRITICAL FIX: Verify SOS filter has at least one section
+        # Verify we got a valid filter
         if sos_hp.shape[0] == 0 or len(sos_hp.shape) != 2 or sos_hp.shape[1] != 6:
-            # Create a minimal pass-through filter (single section)
+            # Create a minimal pass-through filter
             sos_hp = cp.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=cp.float32)
             logger.warning("Created fallback pass-through filter for brown noise HP")
     except Exception as e:
         # More detailed error logging
         logger.warning(f"Error creating brown HP filter: {e}, using fallback")
         logger.debug(f"Filter parameters: cutoff_hp={cutoff_hp}, nyquist={nyquist}")
-        # Create a guaranteed valid SOS filter (pass-through)
+        # Create a minimal pass-through filter as fallback
         sos_hp = cp.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=cp.float32)
-    
-    # CRITICAL FIX: Final safety check to ensure non-empty SOS array
-    if sos_hp.shape[0] == 0 or sos_hp.size == 0:
-        sos_hp = cp.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=cp.float32)
-        logger.warning("Emergency fallback: Created guaranteed valid SOS filter")
     
     # Cache the result
     _filter_cache['brown_hp'][sample_rate] = sos_hp
@@ -511,10 +506,11 @@ class NoiseGenerator:
         # Second-order sections form for better numerical stability in high-pass
         self._brown_hp_sos = create_brown_filters(self.config.sample_rate)
         
-        # CRITICAL FIX: Ensure SOS filter has valid shape for initialization
+        # Ensure SOS filter has valid shape for initialization
         if self._brown_hp_sos.shape[0] == 0 or len(self._brown_hp_sos.shape) != 2 or self._brown_hp_sos.shape[1] != 6:
+            logger.warning(f"Invalid brown HP SOS filter shape: {self._brown_hp_sos.shape}, creating fallback")
+            # Create a minimal valid SOS filter (pass-through) as fallback
             self._brown_hp_sos = cp.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=self.precision)
-            logger.warning("Initializing with fallback SOS filter for brown noise HP")
         
         # Create shelf filter for enhanced brown noise low end
         self._brown_shelf_b, self._brown_shelf_a = create_shelf_filter(
@@ -528,21 +524,19 @@ class NoiseGenerator:
         self._brown_b = cp.array([scale], dtype=self.precision)
         self._brown_a = cp.array([1.0, -alpha], dtype=self.precision)
         
-        # Initialize brown noise filter states for both channels - FIX: ensure at least dimension 1
-        brown_order = max(len(self._brown_a), len(self._brown_b)) - 1
-        brown_order = max(1, brown_order)  # Ensure at least order 1 for stable initialization
+        # CRITICAL FIX: Ensure filter orders are AT LEAST 1 for all filters
+        # Initialize brown noise filter states for both channels
+        brown_order = max(1, len(self._brown_a) - 1)  # Ensure at least order 1
         self._brown_zi_left = cp.zeros(brown_order, dtype=self.precision)
         self._brown_zi_right = cp.zeros(brown_order, dtype=self.precision)
         
         # For SOS filters, state is per section, with 2 values per section
-        # CRITICAL FIX: Ensure n_sections is at least 1 - absolute safeguard
-        n_sections = max(1, self._brown_hp_sos.shape[0])
+        n_sections = self._brown_hp_sos.shape[0]
         self._brown_hp_zi_left = cp.zeros((n_sections, 2), dtype=self.precision)
         self._brown_hp_zi_right = cp.zeros((n_sections, 2), dtype=self.precision)
         
         # For shelf filters, ensure non-zero state dimensions
-        shelf_order = max(len(self._brown_shelf_a), len(self._brown_shelf_b)) - 1
-        shelf_order = max(1, shelf_order)  # Ensure at least order 1
+        shelf_order = max(1, len(self._brown_shelf_a) - 1)  # Ensure at least order 1
         self._brown_shelf_zi_left = cp.zeros(shelf_order, dtype=self.precision)
         self._brown_shelf_zi_right = cp.zeros(shelf_order, dtype=self.precision)
         
@@ -626,13 +620,16 @@ class NoiseGenerator:
         return self._pink_buffer[:, :block_size]
     
     def _generate_brown_noise(self, white_noise, block_size):
-        """Generate enhanced brown noise from white noise (stereo) with improved SOS filtering"""
+        """Generate enhanced brown noise from white noise (stereo) with more robust error handling"""
         try:
+            # For simplicity, completely replace previous implementation to ensure it works
             # Get left and right channels
             left = white_noise[0, :block_size]
             right = white_noise[1, :block_size]
             
-            # Check filter states and recreate if needed
+            # CRITICAL FIX: Copy and recreate filter states to ensure proper dimensions
+            # For really small block sizes, there can be dimension issues
+            # This is a defensive approach that creates new filter states each time
             if len(self._brown_zi_left) == 0:
                 brown_order = max(1, len(self._brown_a) - 1)
                 self._brown_zi_left = cp.zeros(brown_order, dtype=self.precision)
@@ -643,98 +640,72 @@ class NoiseGenerator:
                 self._brown_shelf_zi_left = cp.zeros(shelf_order, dtype=self.precision)
                 self._brown_shelf_zi_right = cp.zeros(shelf_order, dtype=self.precision)
             
-            # CRITICAL FIX: Verify SOS filter state dimensions
-            n_sections = self._brown_hp_sos.shape[0]
-            if n_sections == 0 or self._brown_hp_zi_left.shape[0] != n_sections:
-                # Recreate with guaranteed valid dimensions
-                n_sections = max(1, n_sections)  # Ensure at least one section
-                self._brown_hp_zi_left = cp.zeros((n_sections, 2), dtype=self.precision)
-                self._brown_hp_zi_right = cp.zeros((n_sections, 2), dtype=self.precision)
-                logger.debug(f"Recreated SOS filter states with shape ({n_sections}, 2)")
+            # Process each channel separately, which is more robust
             
-            # Process left channel
-            # 1. Apply leaky integrator
+            # 1. Apply leaky integrator to left channel
             try:
                 left_brown, self._brown_zi_left = cusignal.lfilter(
                     self._brown_b, self._brown_a, left, zi=self._brown_zi_left)
             except Exception as e:
                 logger.warning(f"Brown noise leaky integrator left channel failed: {e}")
+                # Fall back to simpler implementation
                 left_brown = cusignal.lfilter(self._brown_b, self._brown_a, left)
                 
-            # 2. Apply shelf filter
+            # 2. Apply shelf filter to left
             try:
                 left_brown, self._brown_shelf_zi_left = cusignal.lfilter(
                     self._brown_shelf_b, self._brown_shelf_a, left_brown, zi=self._brown_shelf_zi_left)
             except Exception as e:
                 logger.warning(f"Brown noise shelf filter left channel failed: {e}")
+                # Fall back to simpler implementation
                 left_brown = cusignal.lfilter(self._brown_shelf_b, self._brown_shelf_a, left_brown)
                 
-            # 3. Apply high-pass with robust error handling
+            # 3. Apply high-pass to left
             try:
-                # CRITICAL FIX: Verify SOS shape before using
-                if self._brown_hp_sos.shape[0] > 0 and self._brown_hp_sos.shape[1] == 6:
-                    left_brown, self._brown_hp_zi_left = cusignal.sosfilt(
-                        self._brown_hp_sos, left_brown, zi=self._brown_hp_zi_left)
-                else:
-                    # Use direct filtering without state if SOS shape is invalid
-                    logger.warning("Invalid SOS filter shape, using direct filtering for left channel")
-                    left_brown = cusignal.sosfilt(
-                        cp.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=self.precision), 
-                        left_brown)
+                left_brown, self._brown_hp_zi_left = cusignal.sosfilt(
+                    self._brown_hp_sos, left_brown, zi=self._brown_hp_zi_left)
             except Exception as e:
                 logger.warning(f"Brown noise HP filter left channel failed: {e}")
-                # Ultimate fallback - just apply a gentle high-pass using an IIR filter
-                left_brown = cusignal.lfilter(
-                    cp.array([0.95, -0.95], dtype=self.precision), 
-                    cp.array([1.0, -0.9], dtype=self.precision), 
-                    left_brown)
+                # Fall back to simpler implementation
+                left_brown = cusignal.sosfilt(self._brown_hp_sos, left_brown)
             
-            # Process right channel
-            # 1. Apply leaky integrator
+            # Process right channel with the same robust approach
+            # 1. Apply leaky integrator to right channel
             try:
                 right_brown, self._brown_zi_right = cusignal.lfilter(
                     self._brown_b, self._brown_a, right, zi=self._brown_zi_right)
             except Exception as e:
                 logger.warning(f"Brown noise leaky integrator right channel failed: {e}")
+                # Fall back to simpler implementation
                 right_brown = cusignal.lfilter(self._brown_b, self._brown_a, right)
                 
-            # 2. Apply shelf filter
+            # 2. Apply shelf filter to right
             try:
                 right_brown, self._brown_shelf_zi_right = cusignal.lfilter(
                     self._brown_shelf_b, self._brown_shelf_a, right_brown, zi=self._brown_shelf_zi_right)
             except Exception as e:
                 logger.warning(f"Brown noise shelf filter right channel failed: {e}")
+                # Fall back to simpler implementation
                 right_brown = cusignal.lfilter(self._brown_shelf_b, self._brown_shelf_a, right_brown)
                 
-            # 3. Apply high-pass with robust error handling
+            # 3. Apply high-pass to right
             try:
-                # CRITICAL FIX: Verify SOS shape before using
-                if self._brown_hp_sos.shape[0] > 0 and self._brown_hp_sos.shape[1] == 6:
-                    right_brown, self._brown_hp_zi_right = cusignal.sosfilt(
-                        self._brown_hp_sos, right_brown, zi=self._brown_hp_zi_right)
-                else:
-                    # Use direct filtering without state if SOS shape is invalid
-                    logger.warning("Invalid SOS filter shape, using direct filtering for right channel")
-                    right_brown = cusignal.sosfilt(
-                        cp.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=self.precision), 
-                        right_brown)
+                right_brown, self._brown_hp_zi_right = cusignal.sosfilt(
+                    self._brown_hp_sos, right_brown, zi=self._brown_hp_zi_right)
             except Exception as e:
                 logger.warning(f"Brown noise HP filter right channel failed: {e}")
-                # Ultimate fallback - just apply a gentle high-pass using an IIR filter
-                right_brown = cusignal.lfilter(
-                    cp.array([0.95, -0.95], dtype=self.precision), 
-                    cp.array([1.0, -0.9], dtype=self.precision), 
-                    right_brown)
+                # Fall back to simpler implementation
+                right_brown = cusignal.sosfilt(self._brown_hp_sos, right_brown)
             
             # Store results
             self._brown_buffer[0, :block_size] = left_brown
             self._brown_buffer[1, :block_size] = right_brown
-                
+            
         except Exception as e:
             # Comprehensive error handling with detailed info
             logger.warning(f"Brown noise generation failed: {e}. Falling back to white noise.")
-            logger.debug(f"Brown noise debug: white_noise shape={white_noise.shape}, block_size={block_size}")
-            logger.debug(f"SOS filter shape: {self._brown_hp_sos.shape}")
+            logger.debug(f"Brown noise input shape: {white_noise.shape}, block_size: {block_size}")
+            logger.debug(f"Filter state shapes - leaky: {self._brown_zi_left.shape}, shelf: {self._brown_shelf_zi_left.shape}")
             
             # Fall back to white noise with reduced gain
             self._brown_buffer[:, :block_size] = white_noise[:, :block_size] * 0.5
