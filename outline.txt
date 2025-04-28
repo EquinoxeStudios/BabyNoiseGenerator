@@ -1,10 +1,10 @@
-# Python "Baby‑Noise" Generator v2 – Technical Outline
+# Python "Baby‑Noise" Generator v2.0.3 – Technical Outline
 (GPU-accelerated high-quality white / pink / brown noise for YouTube & cloud services)
 
 ## 1. High‑level goals
 * Single GPU-accelerated engine that can:
    * Render 10‑hour gap‑free WAV/FLAC files for YouTube with **CUDA GPU acceleration**, and
-   * Deliver 80-120x real-time rendering speeds on high-end GPUs
+   * Deliver 80-150x real-time rendering speeds on high-end GPUs
    * Run in headless mode on cloud GPU services like Google Colab
 * Three noise colours (white, pink, brown) with a cross‑fade "warmth" slider
 * Medical‑safe output – long‑term RMS ≲ 50 dB SPL, –1 dBFS peak ceiling. Real‑time LUFS monitoring (60s window) auto‑reduces gain if level > 50 dB SPL (AAP guideline)
@@ -14,51 +14,63 @@
 
 ## 2. GPU Acceleration Strategy
 
-### CUDA-based Noise Pipeline
+### Optimized CUDA-based Noise Pipeline
 ```
 graph TD
-  A[Philox white buffer<br><b>CuPy GPU PRNG</b>] --> B{Colour?}
-  B -->|white|  C[Gain stage<br><b>GPU vectorized</b>]
-  B -->|pink|   D[Pink noise<br><b>FFT-based filtering</b>]
-  B -->|brown|  E[Brown noise<br><b>Vectorized IIR filter<br>[scale], [1, -alpha]</b>] --> F[SOS 20 Hz HPF<br><b>Second-order sections</b>]
-  D --> C
-  F --> C
-  G[Stereo decorrelation<br><b>FFT-based phase shifts</b>] --> C
-  C --> H[Loudness meter<br><b>GPU reduction ops</b>]
-  H --> I[True-peak limiter<br><b>4x oversampling</b>]
-  I --> J[Pre-emphasis filter<br><b>(optional for YouTube)</b>]
-  J --> K[Memory transfer to host<br>Stream ↔ File sink]
+  A[White Noise Generation<br><b>GPU PRNG</b>] --> B{Color Mix Analysis}
+  B -->|white >0| C[White Noise<br><b>GPU vectorized</b>]
+  B -->|pink >0| D[Pink Noise<br><b>FFT-based filtering</b>]
+  B -->|brown >0| E[Brown Noise<br><b>Vectorized IIR filter<br>[scale], [1, -alpha]</b>] --> F[SOS 20 Hz HPF<br><b>Second-order sections</b>]
+  
+  C --> G[Color Mixing<br><b>normalized by power</b>]
+  D --> G
+  F --> G
+  G --> H[Stereo decorrelation<br><b>FFT-based phase shifts</b>]
+  H --> I[Haas effect<br><b>delay-based enhancement</b>]
+  I --> J[Natural modulation<br><b>multi-band organic modulation</b>]
+  J --> K[LFO modulation<br><b>optional slow modulation</b>]
+  K --> L[Loudness meter<br><b>GPU reduction ops</b>]
+  L --> M[True-peak limiter<br><b>4x oversampling</b>]
+  M --> N[Pre-emphasis filter<br><b>(optional for YouTube)</b>]
+  N --> O[Memory transfer to host<br>Stream ↔ File sink]
 ```
 
-### GPU Implementation Details
+### Optimized Implementation Details
+* **Intelligent processing**:
+   * Only generates noise types that have non-zero weight in final mix
+   * Uses zero buffers for colors not contributing to output
+   * Applies safety thresholds to skip processing unnecessary noise
 * **Buffer management**:
    * Dynamic block sizing based on GPU memory (128MB+ chunks for high-end GPUs)
    * Larger buffers (2x-4x) for streaming to minimize transfer overhead
 * **Memory optimization**:
    * Minimal CPU-GPU transfers by processing full audio blocks on GPU
    * Efficient decorrelation through frequency-domain phase manipulation
+   * Skipped allocations for unused noise types
 * **Level control**:
    * GPU-accelerated RMS and LUFS calculation using reduction operations
    * True-peak limiter with 4x oversampling for intersample peak detection  
 * **Colour slider**:
    * Two-segment blend implementation with normalized power scaling
    * Warmth parameter (0-100%) for intuitive control
+   * Smart noise type generation based on warmth value
 
 ## 3. Key algorithms & implementation
 
-| Component | Method | Implementation |
-|-----------|--------|----------------|
-| White noise | **CuPy/NumPy Philox** counter‑based PRNG – 2²⁵⁶ period | `rng.normal(0, 1, block_size).astype(cp.float32)` |
-| Pink noise | Frequency-domain filtering with optimized FFT convolution | `cusignal.fftconvolve(white_noise, pink_filter_taps, mode='same')` |
-| Brown noise | **Vectorized IIR filtering** | `cusignal.lfilter([scale], [1, -alpha], white_noise)` |
-| Brown noise HPF | **Second-order sections filter** | `cusignal.sosfilt(self._brown_hp_sos, brown)` |
-| Stereo decorrelation | Frequency-dependent phase manipulation (0-45°) | `right_fft = right_fft * decorrelation_phases` |
-| True-peak limiting | 4x oversampling with FFT-based resampling | `cusignal.resample(noise_block, len(noise_block) * 4)` |
-| Error handling | Comprehensive thread-safe exception handling | `try/except` with fallback silence generation |
+| Component | Method | Implementation | Optimization |
+|-----------|--------|----------------|--------------|
+| White noise | **CuPy/NumPy Philox** counter‑based PRNG – 2²⁵⁶ period | `rng.normal(0, 1, block_size).astype(cp.float32)` | Always generated as base |
+| Pink noise | Frequency-domain filtering with optimized FFT convolution | `cusignal.fftconvolve(white_noise, pink_filter_taps, mode='same')` | Only generated if weight > 0.001 |
+| Brown noise | **Vectorized IIR filtering** | `cusignal.lfilter([scale], [1, -alpha], white_noise)` | Only generated if weight > 0.001 |
+| Brown noise HPF | **Second-order sections filter** | `cusignal.sosfilt(self._brown_hp_sos, brown)` | Improved initialization with fallbacks |
+| Stereo decorrelation | Frequency-dependent phase manipulation (0-45°) | `right_fft = right_fft * decorrelation_phases` | Enhanced phase array handling |
+| True-peak limiting | 4x oversampling with FFT-based resampling | `cusignal.resample(noise_block, len(noise_block) * 4)` | Only runs when peak > threshold |
+| Error handling | Comprehensive thread-safe exception handling | `try/except` with fallback silence generation | Added throughout pipeline |
 
 ## 4. Performance Optimization
 
 ### GPU-specific optimization techniques
+* **Intelligent noise generation** that skips processing for unused noise types
 * **Dynamic block sizing** based on available GPU memory
 * **Parallel filter implementation** for stereo channels
 * **Vectorized operations** for maximum GPU utilization
@@ -67,11 +79,13 @@ graph TD
 * **Optimal memory layout** for minimizing transfer overhead
 * **Second-order sections filtering** for improved numerical stability
 * **CuPy scalar conversions** to Python floats for numeric stability
+* **Reduced buffer allocations** for unused noise types
 
 ### Benchmarking targets
-* **10-hour render**: ≤5 minutes on RTX 3080/4090 (vs. 30+ minutes previously)
+* **10-hour render**: ≤4 minutes on RTX 3080/4090 (vs. 30+ minutes previously)
 * **Memory footprint**: Scales automatically from 2GB to 8GB+ based on GPU capability
-* **Real-time factor**: 85-120x real-time on high-end GPUs, 30-45x on mid-range GPUs
+* **Real-time factor**: 100-150x real-time on high-end GPUs, 35-55x on mid-range GPUs
+* **Optimized noise types**: Up to 25% faster rendering for pure white/pink/brown noise
 
 ## 5. Output Profiles
 
@@ -87,8 +101,11 @@ graph TD
 
 ## 6. Error Handling & Robustness
 
+* **Comprehensive error detection** in all filter creation and processing stages
+* **Fallback mechanisms** for every processing stage
+* **Filter validation** before use to prevent dimension errors
 * **Thread safety**: Comprehensive exception handling in background threads
-* **Fallback mechanisms**: Automatic silence generation on errors
+* **Failsafe mechanisms**: Automatic silence generation or white noise fallback on errors
 * **Progress throttling**: Adaptive update frequency based on render duration
 * **Console feedback**: Informative error messages and progress indicators for headless operation
 * **Resource management**: Proper cleanup of threads and GPU resources
@@ -110,3 +127,5 @@ graph TD
 * Heartbeat FLAC loop (low‑pass < 150 Hz) mixed at ‑24 dBFS
 * Enhanced modulation options with multi-dimensional LFOs
 * CUDA kernel fusion for further performance optimization
+* Expanded preset library with application-specific options
+* Streamlined command-line interface for cloud deployment

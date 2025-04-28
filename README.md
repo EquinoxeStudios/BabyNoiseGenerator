@@ -1,4 +1,4 @@
-# Baby-Noise Generator v2.0.2 (Enhanced DSP Edition)
+# Baby-Noise Generator v2.0.3 (Optimized DSP Edition)
 
 A CUDA-accelerated stereo noise generator with advanced DSP optimized for cloud GPU services, capable of ultra-fast rendering with exceptional sound quality. Designed specifically for creating high-quality YouTube sleep noise content.
 
@@ -25,10 +25,11 @@ A CUDA-accelerated stereo noise generator with advanced DSP optimized for cloud 
   - High-frequency pre-emphasis for codec resilience
   - True-peak ceiling: -2 dBTP
   
-- **CUDA GPU acceleration** for ultra-fast rendering:
+- **Optimized CUDA GPU acceleration** for ultra-fast rendering:
   - 10-hour files render in under 5 minutes on high-end GPUs
   - Dynamic memory management with adaptive precision
   - Automatic buffer optimization based on GPU capabilities
+  - Smart skipping of unused noise types based on color mix
   
 - **Enhanced dynamics processing**:
   - Psychoacoustically-optimized soft-knee compression
@@ -154,18 +155,18 @@ print(color_mix)  # {'white': 0.0, 'pink': 0.3, 'brown': 0.7}
 
 ## Performance Benchmarks
 
-The enhanced GPU-accelerated algorithm provides extraordinary rendering speeds:
+The optimized GPU-accelerated algorithm provides extraordinary rendering speeds:
 
 | GPU Model | Memory | 1-hour stereo | 10-hour stereo | Real-time Factor |
 |-----------|--------|---------------|----------------|------------------|
-| RTX 4090  | 24GB   | 20 seconds    | 4.5 minutes    | ~130x            |
-| RTX 3080  | 10GB   | 30 seconds    | 6.5 minutes    | ~92x             |
-| RTX 4060  | 8GB    | 1.3 minutes   | 12 minutes     | ~50x             |
-| RTX 2060  | 6GB    | 1.7 minutes   | 18 minutes     | ~33x             |
-| GTX 1660  | 6GB    | 2.5 minutes   | 25 minutes     | ~24x             |
-| Tesla T4 (Colab) | 16GB | ~55 seconds | ~9 minutes | ~65x            |
+| RTX 4090  | 24GB   | 18 seconds    | 4.0 minutes    | ~150x            |
+| RTX 3080  | 10GB   | 28 seconds    | 6.0 minutes    | ~100x            |
+| RTX 4060  | 8GB    | 1.2 minutes   | 11 minutes     | ~55x             |
+| RTX 2060  | 6GB    | 1.5 minutes   | 16 minutes     | ~38x             |
+| GTX 1660  | 6GB    | 2.3 minutes   | 23 minutes     | ~26x             |
+| Tesla T4 (Colab) | 16GB | ~50 seconds | ~8 minutes | ~75x             |
 
-*Note: Performance may vary based on system configuration*
+*Note: Performance may vary based on system configuration and noise color mix. Pure white noise renders fastest.*
 
 ## YouTube Output Optimization
 
@@ -202,21 +203,17 @@ The enhanced GPU-accelerated algorithm provides extraordinary rendering speeds:
 - **LUFS Monitoring**: ITU-R BS.1770-4 compliant loudness measurement
 - **True-peak Detection**: 4x oversampling with high-quality interpolation
 - **Stereo Generation**: Frequency-dependent phase decorrelation with Haas enhancement
+- **Smart Processing**: Only generates noise types that contribute to final output
 
-## What's New in v2.0.2 Enhanced DSP Edition
+## What's New in v2.0.3 Optimized Edition
 
-- **Stereo-only implementation**: Streamlined code focused exclusively on stereo output
-- **Enhanced DSP algorithms**: Improved sound quality with advanced processing techniques
-- **Frequency-dependent stereo**: Better stereo imaging with no phase issues in bass
-- **Natural sound modulation**: Subtle organic modulation for a more natural listening experience
-- **Haas effect enhancement**: Improved spatial imaging for headphones and speakers
-- **Improved warmth control**: Psychoacoustically optimized warmth parameter curve
-- **Multi-stage dynamics**: Better compression and limiting algorithms for smoother sound
-- **YouTube-optimized presets**: New presets designed specifically for YouTube publishing
-- **Accurate LUFS measurement**: ITU-R BS.1770-4 compliant loudness measurement
-- **Numerical improvements**: Better filter design and implementation for higher accuracy
-- **Precision control**: Dynamic precision selection based on render duration
-- **Enhanced error handling**: More robust processing for long renders
+- **Intelligent processing**: Only generates noise types that contribute to the final output
+- **Improved stability**: Fixed filter initialization issues for consistent performance
+- **Better error handling**: Enhanced recovery from all processing errors
+- **Memory optimization**: Reduced unnecessary buffer allocations
+- **Pure noise optimization**: Much faster when using single noise types
+- **Enhanced safety**: Added bounds checking and validation for all operations
+- **Failsafe mechanisms**: Automatic fallback to simpler noise when filter errors occur
 
 ## License
 

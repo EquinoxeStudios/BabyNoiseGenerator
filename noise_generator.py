@@ -242,16 +242,25 @@ def create_brown_filters(sample_rate):
         return _filter_cache['brown_hp'][sample_rate]
     
     # High-pass filter to remove DC offset (20 Hz cutoff)
-    cutoff_hp = 20.0 / (sample_rate / 2)
-    sos_hp = cusignal.butter(2, cutoff_hp, 'high', output='sos')
+    nyquist = sample_rate / 2
+    cutoff_hp = 20.0 / nyquist
     
-    # Low shelf filter to enhance low-end body (75 Hz, +3dB)
-    # This would normally use cusignal.butter with 'lowshelf', but we'll implement manually for now
-    cutoff_shelf = 75.0 / (sample_rate / 2)
-    gain_db = 3.0
+    # Ensure cutoff is valid (between 0 and 1)
+    cutoff_hp = max(0.001, min(0.99, cutoff_hp))
     
-    # Approximate shelf filter with 2nd order Butterworth cascade
-    # Save both in cache
+    try:
+        sos_hp = cusignal.butter(2, cutoff_hp, 'high', output='sos')
+        
+        # Verify we got a valid filter
+        if sos_hp.shape[0] == 0 or len(sos_hp.shape) != 2 or sos_hp.shape[1] != 6:
+            # Create a minimal pass-through filter
+            sos_hp = cp.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=cp.float32)
+            logger.warning("Created fallback pass-through filter for brown noise HP")
+    except Exception as e:
+        logger.warning(f"Error creating brown HP filter: {e}, using fallback")
+        sos_hp = cp.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=cp.float32)
+    
+    # Cache the result
     _filter_cache['brown_hp'][sample_rate] = sos_hp
     
     return sos_hp
@@ -267,18 +276,32 @@ def create_shelf_filter(sample_rate, cutoff, gain_db):
     nyquist = sample_rate / 2
     normalized_cutoff = cutoff / nyquist
     
+    # Ensure cutoff is valid (between 0 and 1)
+    normalized_cutoff = max(0.001, min(0.99, normalized_cutoff))
+    
     # Use second-order butterworth filter approximation
     # This is a simple approximation of a shelf filter
-    if gain_db > 0:
-        # Low shelf boost (for brown noise enhancement)
-        b, a = cusignal.butter(2, normalized_cutoff, 'low')
-        gain_linear = 10 ** (gain_db / 20.0)
-        b = b * gain_linear
-    else:
-        # High shelf cut (not used here but included for completeness)
-        b, a = cusignal.butter(2, normalized_cutoff, 'high')
-        gain_linear = 10 ** (-gain_db / 20.0)
-        b = b * gain_linear
+    try:
+        if gain_db > 0:
+            # Low shelf boost (for brown noise enhancement)
+            b, a = cusignal.butter(2, normalized_cutoff, 'low')
+            gain_linear = 10 ** (gain_db / 20.0)
+            b = b * gain_linear
+        else:
+            # High shelf cut (not used here but included for completeness)
+            b, a = cusignal.butter(2, normalized_cutoff, 'high')
+            gain_linear = 10 ** (-gain_db / 20.0)
+            b = b * gain_linear
+            
+        # Verify filter validity
+        if len(b) == 0 or len(a) == 0:
+            # Create a pass-through filter as fallback
+            b = cp.array([1.0], dtype=cp.float32)
+            a = cp.array([1.0], dtype=cp.float32)
+    except Exception as e:
+        logger.warning(f"Error creating shelf filter: {e}, using fallback")
+        b = cp.array([1.0], dtype=cp.float32)
+        a = cp.array([1.0], dtype=cp.float32)
     
     # Cache the result
     _filter_cache['brown_shelf'][cache_key] = (b, a)
@@ -478,6 +501,12 @@ class NoiseGenerator:
         # Second-order sections form for better numerical stability in high-pass
         self._brown_hp_sos = create_brown_filters(self.config.sample_rate)
         
+        # Ensure SOS filter has valid shape for initialization
+        if self._brown_hp_sos.shape[0] == 0 or len(self._brown_hp_sos.shape) != 2 or self._brown_hp_sos.shape[1] != 6:
+            logger.warning(f"Invalid brown HP SOS filter shape: {self._brown_hp_sos.shape}, creating fallback")
+            # Create a minimal valid SOS filter (pass-through) as fallback
+            self._brown_hp_sos = cp.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=self.precision)
+        
         # Create shelf filter for enhanced brown noise low end
         self._brown_shelf_b, self._brown_shelf_a = create_shelf_filter(
             self.config.sample_rate, 75.0, 3.0)  # 75Hz, +3dB boost
@@ -496,8 +525,10 @@ class NoiseGenerator:
         self._brown_zi_right = cp.zeros(brown_order, dtype=self.precision)
         
         # For SOS filters, state is per section, with 2 values per section
-        self._brown_hp_zi_left = cp.zeros((self._brown_hp_sos.shape[0], 2), dtype=self.precision)
-        self._brown_hp_zi_right = cp.zeros((self._brown_hp_sos.shape[0], 2), dtype=self.precision)
+        # Ensure we have a valid filter shape first
+        n_sections = self._brown_hp_sos.shape[0]
+        self._brown_hp_zi_left = cp.zeros((n_sections, 2), dtype=self.precision)
+        self._brown_hp_zi_right = cp.zeros((n_sections, 2), dtype=self.precision)
         
         self._brown_shelf_zi_left = cp.zeros(max(len(self._brown_shelf_a), len(self._brown_shelf_b))-1, dtype=self.precision)
         self._brown_shelf_zi_right = cp.zeros(max(len(self._brown_shelf_a), len(self._brown_shelf_b))-1, dtype=self.precision)
@@ -583,39 +614,44 @@ class NoiseGenerator:
     
     def _generate_brown_noise(self, white_noise, block_size):
         """Generate enhanced brown noise from white noise (stereo)"""
-        # Process left channel
-        left = white_noise[0, :block_size]
-        right = white_noise[1, :block_size]
-        
-        # Process left channel
-        # First-order leaky integrator
-        left_brown, self._brown_zi_left = cusignal.lfilter(
-            self._brown_b, self._brown_a, left, zi=self._brown_zi_left)
-        
-        # Apply low-shelf filter for enhanced low-end
-        left_brown, self._brown_shelf_zi_left = cusignal.lfilter(
-            self._brown_shelf_b, self._brown_shelf_a, left_brown, zi=self._brown_shelf_zi_left)
-        
-        # Apply high-pass to remove DC offset
-        left_brown, self._brown_hp_zi_left = cusignal.sosfilt(
-            self._brown_hp_sos, left_brown, zi=self._brown_hp_zi_left)
-        
-        # Process right channel
-        # First-order leaky integrator
-        right_brown, self._brown_zi_right = cusignal.lfilter(
-            self._brown_b, self._brown_a, right, zi=self._brown_zi_right)
-        
-        # Apply low-shelf filter for enhanced low-end
-        right_brown, self._brown_shelf_zi_right = cusignal.lfilter(
-            self._brown_shelf_b, self._brown_shelf_a, right_brown, zi=self._brown_shelf_zi_right)
-        
-        # Apply high-pass to remove DC offset
-        right_brown, self._brown_hp_zi_right = cusignal.sosfilt(
-            self._brown_hp_sos, right_brown, zi=self._brown_hp_zi_right)
-        
-        # Store results
-        self._brown_buffer[0, :block_size] = left_brown
-        self._brown_buffer[1, :block_size] = right_brown
+        try:
+            # Process left channel
+            left = white_noise[0, :block_size]
+            right = white_noise[1, :block_size]
+            
+            # Process left channel
+            # First-order leaky integrator
+            left_brown, self._brown_zi_left = cusignal.lfilter(
+                self._brown_b, self._brown_a, left, zi=self._brown_zi_left)
+            
+            # Apply low-shelf filter for enhanced low-end
+            left_brown, self._brown_shelf_zi_left = cusignal.lfilter(
+                self._brown_shelf_b, self._brown_shelf_a, left_brown, zi=self._brown_shelf_zi_left)
+            
+            # Apply high-pass to remove DC offset
+            left_brown, self._brown_hp_zi_left = cusignal.sosfilt(
+                self._brown_hp_sos, left_brown, zi=self._brown_hp_zi_left)
+            
+            # Process right channel
+            # First-order leaky integrator
+            right_brown, self._brown_zi_right = cusignal.lfilter(
+                self._brown_b, self._brown_a, right, zi=self._brown_zi_right)
+            
+            # Apply low-shelf filter for enhanced low-end
+            right_brown, self._brown_shelf_zi_right = cusignal.lfilter(
+                self._brown_shelf_b, self._brown_shelf_a, right_brown, zi=self._brown_shelf_zi_right)
+            
+            # Apply high-pass to remove DC offset
+            right_brown, self._brown_hp_zi_right = cusignal.sosfilt(
+                self._brown_hp_sos, right_brown, zi=self._brown_hp_zi_right)
+            
+            # Store results
+            self._brown_buffer[0, :block_size] = left_brown
+            self._brown_buffer[1, :block_size] = right_brown
+        except Exception as e:
+            # Fallback to white noise in case of filter error
+            logger.warning(f"Brown noise generation failed: {e}. Falling back to white noise.")
+            self._brown_buffer[:, :block_size] = white_noise[:, :block_size] * 0.5  # Reduced gain
         
         return self._brown_buffer[:, :block_size]
     
@@ -710,16 +746,32 @@ class NoiseGenerator:
         low_idx = int(300 / freq_resolution)
         mid_idx = int(1500 / freq_resolution)
         
+        # Safety check for frequency indices
+        low_idx = max(1, min(low_idx, n_bins - 2))
+        mid_idx = max(low_idx + 1, min(mid_idx, n_bins - 1))
+        
         # Apply modulation to left channel
         low_env = cp.linspace(1.0, 0.8, low_idx)
         left_fft[:low_idx] = left_fft[:low_idx] * (1.0 + 0.03 * cp.sin(2 * cp.pi * 0.05 * t_start) * low_env)
         
-        mid_env = cp.concatenate([cp.linspace(0.8, 1.0, min(10, low_idx)), 
-                                cp.ones(mid_idx - low_idx - min(10, low_idx))])
-        left_fft[low_idx:mid_idx] = left_fft[low_idx:mid_idx] * (1.0 + 0.02 * cp.sin(2 * cp.pi * 0.13 * t_start) * mid_env)
+        # For mid-range modulation, ensure we have proper array lengths
+        mid_region_length = mid_idx - low_idx
+        if mid_region_length > 0:
+            if mid_region_length <= 10:
+                # For very small mid regions, use simplified approach
+                mid_env = cp.ones(mid_region_length)
+            else:
+                # Create transition and flat regions
+                mid_env_first_part = cp.linspace(0.8, 1.0, min(10, mid_region_length))
+                mid_env_second_part = cp.ones(mid_region_length - len(mid_env_first_part))
+                mid_env = cp.concatenate([mid_env_first_part, mid_env_second_part])
+                
+            left_fft[low_idx:mid_idx] = left_fft[low_idx:mid_idx] * (1.0 + 0.02 * cp.sin(2 * cp.pi * 0.13 * t_start) * mid_env)
         
-        high_env = cp.ones(n_bins - mid_idx)
-        left_fft[mid_idx:] = left_fft[mid_idx:] * (1.0 + 0.01 * cp.sin(2 * cp.pi * 0.21 * t_start) * high_env)
+        # For high frequencies
+        if n_bins > mid_idx:
+            high_env = cp.ones(n_bins - mid_idx)
+            left_fft[mid_idx:] = left_fft[mid_idx:] * (1.0 + 0.01 * cp.sin(2 * cp.pi * 0.21 * t_start) * high_env)
         
         # Convert back to time domain
         noise_block[0, :block_size] = cufft.irfft(left_fft, n=block_size)
@@ -729,9 +781,15 @@ class NoiseGenerator:
         
         # Apply modulation to right channel with phase offset
         phase_offset = cp.pi / 4  # 45 degree offset
+        
+        # Apply with same safety checks as left channel
         right_fft[:low_idx] = right_fft[:low_idx] * (1.0 + 0.03 * cp.sin(2 * cp.pi * 0.05 * t_start + phase_offset) * low_env)
-        right_fft[low_idx:mid_idx] = right_fft[low_idx:mid_idx] * (1.0 + 0.02 * cp.sin(2 * cp.pi * 0.13 * t_start + phase_offset) * mid_env)
-        right_fft[mid_idx:] = right_fft[mid_idx:] * (1.0 + 0.01 * cp.sin(2 * cp.pi * 0.21 * t_start + phase_offset) * high_env)
+        
+        if mid_region_length > 0:
+            right_fft[low_idx:mid_idx] = right_fft[low_idx:mid_idx] * (1.0 + 0.02 * cp.sin(2 * cp.pi * 0.13 * t_start + phase_offset) * mid_env)
+            
+        if n_bins > mid_idx:
+            right_fft[mid_idx:] = right_fft[mid_idx:] * (1.0 + 0.01 * cp.sin(2 * cp.pi * 0.21 * t_start + phase_offset) * high_env)
         
         # Convert back to time domain
         noise_block[1, :block_size] = cufft.irfft(right_fft, n=block_size)
@@ -961,46 +1019,72 @@ class NoiseGenerator:
     
     def generate_block(self, block_size, block_start_idx=0):
         """Generate a block of noise with the specified configuration"""
-        # Generate white noise base
-        white_noise = self._generate_white_noise_block(block_size)
-        
-        # Generate pink noise from white noise
-        pink_noise = self._apply_pink_filter(white_noise, block_size)
-        
-        # Generate brown noise from white noise
-        brown_noise = self._generate_brown_noise(white_noise, block_size)
-        
-        # Blend according to color mix
-        mixed_noise = self._blend_noise_colors(
-            white_noise, pink_noise, brown_noise, self.config.color_mix, block_size
-        )
-        
-        # Apply stereo decorrelation
-        mixed_noise = self._apply_stereo_decorrelation(mixed_noise, block_size)
-        
-        # Apply Haas effect for enhanced stereo imaging if enabled
-        if self.config.haas_effect:
-            mixed_noise = self._apply_haas_effect(mixed_noise, block_size)
+        try:
+            # Always generate white noise as the base
+            white_noise = self._generate_white_noise_block(block_size)
             
-        # Apply natural modulation for more organic sound if enabled
-        if self.config.natural_modulation:
-            mixed_noise = self._apply_natural_modulation(mixed_noise, block_start_idx, block_size)
-        
-        # Apply LFO modulation if enabled
-        mixed_noise = self._apply_lfo_modulation(mixed_noise, block_start_idx, block_size)
-        
-        # Apply multi-stage gain and limiting
-        mixed_noise = self._apply_gain_and_limiting(
-            mixed_noise, self.config.rms_target, self.config.peak_ceiling, block_size
-        )
-        
-        # Apply true-peak limiting
-        mixed_noise = self._apply_true_peak_limiting(mixed_noise, self.config.peak_ceiling, block_size)
-        
-        # Apply pre-emphasis if enabled in profile
-        mixed_noise = self._apply_pre_emphasis(mixed_noise, block_size)
-        
-        return mixed_noise
+            # Extract color mix weights
+            white_weight = self.config.color_mix.get('white', 0)
+            pink_weight = self.config.color_mix.get('pink', 0)
+            brown_weight = self.config.color_mix.get('brown', 0)
+            
+            # Initialize noise types that will be used
+            pink_noise = None
+            brown_noise = None
+            
+            # Only generate pink noise if its weight is significant
+            if pink_weight > 0.001:
+                pink_noise = self._apply_pink_filter(white_noise, block_size)
+            else:
+                # Use zero buffer for pink noise if not needed
+                pink_noise = cp.zeros_like(white_noise)
+                
+            # Only generate brown noise if its weight is significant
+            if brown_weight > 0.001:
+                try:
+                    brown_noise = self._generate_brown_noise(white_noise, block_size)
+                except Exception as e:
+                    logger.warning(f"Brown noise generation failed: {e}. Using zero buffer instead.")
+                    brown_noise = cp.zeros_like(white_noise)
+            else:
+                # Use zero buffer for brown noise if not needed
+                brown_noise = cp.zeros_like(white_noise)
+            
+            # Blend according to color mix
+            mixed_noise = self._blend_noise_colors(
+                white_noise, pink_noise, brown_noise, self.config.color_mix, block_size
+            )
+            
+            # Apply stereo decorrelation
+            mixed_noise = self._apply_stereo_decorrelation(mixed_noise, block_size)
+            
+            # Apply Haas effect for enhanced stereo imaging if enabled
+            if self.config.haas_effect:
+                mixed_noise = self._apply_haas_effect(mixed_noise, block_size)
+                
+            # Apply natural modulation for more organic sound if enabled
+            if self.config.natural_modulation:
+                mixed_noise = self._apply_natural_modulation(mixed_noise, block_start_idx, block_size)
+            
+            # Apply LFO modulation if enabled
+            mixed_noise = self._apply_lfo_modulation(mixed_noise, block_start_idx, block_size)
+            
+            # Apply multi-stage gain and limiting
+            mixed_noise = self._apply_gain_and_limiting(
+                mixed_noise, self.config.rms_target, self.config.peak_ceiling, block_size
+            )
+            
+            # Apply true-peak limiting
+            mixed_noise = self._apply_true_peak_limiting(mixed_noise, self.config.peak_ceiling, block_size)
+            
+            # Apply pre-emphasis if enabled in profile
+            mixed_noise = self._apply_pre_emphasis(mixed_noise, block_size)
+            
+            return mixed_noise
+        except Exception as e:
+            logger.error(f"Error in generate_block: {e}")
+            # Return silent audio as fallback
+            return cp.zeros((2, block_size), dtype=self.precision)
     
     def _adjust_block_size(self, current_size, free_memory, used_memory):
         """Adaptively adjust block size based on memory usage"""
@@ -1124,23 +1208,37 @@ class NoiseGenerator:
                     
                     # Apply overlap from previous block if available
                     if overlap_buffer is not None:
-                        # Crossfade with previous block's overlap region
-                        # Make sure the fade arrays are properly shaped for broadcasting
-                        fade_in_shaped = self._fade_in[:overlap, np.newaxis]
-                        fade_out_shaped = self._fade_out[:overlap, np.newaxis]
+                        # Make sure overlap is valid
+                        overlap = min(overlap, len(overlap_buffer), len(output_data))
                         
-                        output_data[:overlap, :] = (
-                            output_data[:overlap, :] * fade_in_shaped + 
-                            overlap_buffer[:overlap, :] * fade_out_shaped
-                        )
+                        if overlap > 0:
+                            # Crossfade with previous block's overlap region
+                            # Make sure the fade arrays are properly shaped for broadcasting
+                            fade_in = self._fade_in[:overlap]
+                            fade_out = self._fade_out[:overlap]
+                            
+                            # Reshape for broadcasting
+                            fade_in_shaped = fade_in.reshape(-1, 1)
+                            fade_out_shaped = fade_out.reshape(-1, 1)
+                            
+                            # Apply crossfade
+                            output_data[:overlap, :] = (
+                                output_data[:overlap, :] * fade_in_shaped + 
+                                overlap_buffer[:overlap, :] * fade_out_shaped
+                            )
                     
                     # Save overlap buffer for next iteration - ensure explicit array conversion
-                    if samples_remaining > overlap:
-                        overlap_buffer = np.array(output_data[-overlap:, :].copy())
+                    if samples_remaining > overlap and overlap > 0:
+                        # Ensure we don't try to copy more than we have
+                        last_overlap = min(overlap, len(output_data))
+                        if last_overlap > 0:
+                            overlap_buffer = np.array(output_data[-last_overlap:, :].copy())
                     
                     # Write to file (excluding overlap for next block)
                     write_length = min(len(output_data) - overlap, samples_remaining)
-                    f.write(output_data[:write_length])
+                    # Ensure we don't write more samples than we have
+                    if write_length > 0:
+                        f.write(output_data[:write_length])
                     
                     # Update progress
                     samples_written += write_length
