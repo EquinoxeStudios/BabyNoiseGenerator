@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Baby-Noise Generator App v2.0.5 - Simplified DSP Edition (Headless Version)
-# Optimized for sound quality and performance with integrated advanced DSP techniques
+# Baby-Noise Generator App v2.0.2 - Enhanced DSP Edition (Headless Version)
+# Optimized for sound quality and performance with advanced DSP techniques
 # Exclusively optimized for GPU acceleration with no CPU fallback
 # Stereo-only version for YouTube publishing
 
@@ -26,20 +26,18 @@ except ImportError:
     )
 
 # Constants
-SAMPLE_RATE = 48000          # Use 48 kHz for YouTube optimization (avoids resampling)
-FFT_BLOCK_SIZE = 2**18       # ~1.36 seconds at 48 kHz (large block optimization)
+SAMPLE_RATE = 44100
+FFT_BLOCK_SIZE = 2**18       # ~1.5 seconds at 44.1 kHz (large block optimization)
 BLOCK_OVERLAP = 4096         # For smooth transitions between blocks
 BROWN_LEAKY_ALPHA = 0.999    # Leaky integrator coefficient
-APP_TITLE = "Noise Generator v2.0.5 - Simplified DSP for YouTube (Headless)"
+APP_TITLE = "Baby-Noise Generator v2.0.2 - Enhanced DSP (Headless)"
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/BabyNoise")
 MIN_DURATION = 1             # Minimum allowed duration in seconds
 MAX_MEMORY_LIMIT_FRACTION = 0.8  # Maximum fraction of GPU memory to use
 
 # Enhanced filter cache with categories for different filter types
 _filter_cache = {
-    'pink_fir': {},          # FIR filters for pink noise
     'pink_iir': {},          # IIR filters for pink noise
-    'pink_spectrum': {},     # Spectral pink filters (NEW)
     'brown_hp': {},          # High-pass filters for brown noise 
     'brown_shelf': {},       # Shelving filters for brown noise enhancement
     'emphasis': {},          # Pre-emphasis filters
@@ -63,13 +61,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("baby-noise-app")
 
-# YouTube optimized output profile
-NOISE_PROFILE = {
-    "rms_target": -20.0,        # Higher RMS for YouTube
-    "lufs_threshold": -16.0,    # LUFS threshold for YouTube
-    "peak_ceiling": -2.0,       # Less headroom needed
-    "pre_emphasis": True,       # Add pre-emphasis for codec resilience
-    "description": "Optimized for YouTube publishing"
+# Output profiles with specific settings
+NOISE_PROFILES = {
+    "baby-safe": {
+        "rms_target": -63.0,        # Default RMS level (AAP guideline)
+        "lufs_threshold": -27.0,    # LUFS threshold (approx AAP guideline)
+        "peak_ceiling": -3.0,       # True peak ceiling
+        "pre_emphasis": False,      # No pre-emphasis needed
+        "description": "AAP-compliant safe levels"
+    },
+    "youtube-pub": {
+        "rms_target": -20.0,        # Higher RMS for YouTube
+        "lufs_threshold": -16.0,    # LUFS threshold for YouTube
+        "peak_ceiling": -2.0,       # Less headroom needed
+        "pre_emphasis": True,       # Add pre-emphasis for codec resilience
+        "description": "Optimized for YouTube publishing"
+    }
 }
 
 # Cache for device info - initialized once and reused
@@ -168,56 +175,6 @@ def determine_precision(duration):
     # Default to full precision
     return cp.float32
 
-def create_pink_filter(n_taps, sample_rate):
-    """Create FIR filter for pink noise using frequency sampling method with caching"""
-    # Check cache first
-    cache_key = (n_taps, sample_rate)
-    if cache_key in _filter_cache['pink_fir']:
-        return _filter_cache['pink_fir'][cache_key]
-    
-    # Create frequency response for pink noise (-10 dB/decade falloff)
-    nyquist = sample_rate / 2
-    freqs = cp.linspace(0, nyquist, n_taps//2 + 1)
-    # Avoid division by zero
-    freqs[0] = freqs[1]
-    
-    # Create pink spectrum (1/f)
-    response = 1.0 / cp.sqrt(freqs)
-    
-    # Normalize
-    response = response / cp.max(response)
-    
-    # Convert to filter taps using FFT
-    # Make sure we get exactly n_taps total with proper symmetry for IFFT
-    if n_taps % 2 == 0:  # Even number of taps
-        # For even N: [R₀, R₁, ..., Rₙ₋₁, Rₙ, Rₙ₋₁, ..., R₁]
-        full_response = cp.concatenate([response, response[-2::-1]])
-    else:  # Odd number of taps
-        # For odd N: [R₀, R₁, ..., Rₙ₋₁, Rₙ₋₁, ..., R₁]
-        full_response = cp.concatenate([response, response[-2:0:-1]])
-    
-    # Ensure exact length
-    if len(full_response) != n_taps:
-        # Pad or truncate to exact length
-        if len(full_response) < n_taps:
-            full_response = cp.pad(full_response, (0, n_taps - len(full_response)))
-        else:
-            full_response = full_response[:n_taps]
-    
-    filter_taps = cp.real(cp.fft.ifft(full_response))
-    
-    # Window the filter to reduce Gibbs phenomenon
-    window = cp.hamming(len(filter_taps))
-    filter_taps = filter_taps * window
-    
-    # Normalize for unity gain at DC
-    filter_taps = filter_taps / cp.sum(filter_taps)
-    
-    # Cache the result
-    _filter_cache['pink_fir'][cache_key] = filter_taps
-    
-    return filter_taps
-
 def create_pink_iir_coeffs(sample_rate):
     """Create enhanced IIR filter coefficients for pink noise (8th order)"""
     # Check cache first
@@ -237,107 +194,49 @@ def create_pink_iir_coeffs(sample_rate):
     return b, a
 
 def create_brown_filters(sample_rate):
-    """Create proper second-order section filters for brown noise with fixed coefficients
-    
-    This implementation uses reliable hardcoded coefficients instead of dynamic design 
-    to avoid numerical stability issues across different GPU types.
-    """
+    """Create filters for enhanced brown noise"""
     # Check cache first
     if sample_rate in _filter_cache['brown_hp']:
-        cached_filter = _filter_cache['brown_hp'][sample_rate]
-        # Verify cached filter is valid
-        if cached_filter.shape[0] > 0 and cached_filter.shape[1] == 6:
-            return cached_filter
+        return _filter_cache['brown_hp'][sample_rate]
     
-    # Create a reliable 2nd order Butterworth high-pass filter with fixed coefficients
-    # [b0, b1, b2, a0, a1, a2] format for SOS
+    # High-pass filter to remove DC offset (20 Hz cutoff)
+    cutoff_hp = 20.0 / (sample_rate / 2)
+    sos_hp = cusignal.butter(2, cutoff_hp, 'high', output='sos')
     
-    # For 48kHz sample rate (~20Hz cutoff)
-    if abs(sample_rate - 48000) < 100:
-        sos_hp = cp.array([
-            [1.0, -2.0, 1.0, 1.0, -1.9822, 0.9824]  # ~20Hz HPF at 48kHz
-        ], dtype=cp.float32)
-    # For 44.1kHz sample rate
-    elif abs(sample_rate - 44100) < 100:
-        sos_hp = cp.array([
-            [1.0, -2.0, 1.0, 1.0, -1.9808, 0.9810]  # ~20Hz HPF at 44.1kHz
-        ], dtype=cp.float32)
-    # For any other sample rate, use a safe generic filter
-    else:
-        sos_hp = cp.array([
-            [1.0, -2.0, 1.0, 1.0, -1.98, 0.98]  # Generic ~20Hz HPF
-        ], dtype=cp.float32)
+    # Low shelf filter to enhance low-end body (75 Hz, +3dB)
+    # This would normally use cusignal.butter with 'lowshelf', but we'll implement manually for now
+    cutoff_shelf = 75.0 / (sample_rate / 2)
+    gain_db = 3.0
     
-    logger.debug(f"Created brown noise HP filter manually with shape {sos_hp.shape}")
-    
-    # Cache the result
+    # Approximate shelf filter with 2nd order Butterworth cascade
+    # Save both in cache
     _filter_cache['brown_hp'][sample_rate] = sos_hp
     
     return sos_hp
 
 def create_shelf_filter(sample_rate, cutoff, gain_db):
-    """Create a proper low shelf filter using biquad coefficients
-    
-    Based on the Audio EQ Cookbook formulations for shelving filters.
-    This provides more precise control over the frequency response.
-    
-    Args:
-        sample_rate: Sample rate in Hz
-        cutoff: Shelf frequency in Hz
-        gain_db: Gain at shelf in dB
-    
-    Returns:
-        Tuple of (b, a) filter coefficients
-    """
+    """Create a shelf filter for frequency enhancement"""
     # Check cache first
     cache_key = (sample_rate, cutoff, gain_db)
     if cache_key in _filter_cache['brown_shelf']:
         return _filter_cache['brown_shelf'][cache_key]
     
-    try:
-        # Convert parameters
-        fs = float(sample_rate)
-        f0 = float(cutoff)
-        gain = float(gain_db)
-        
-        # Ensure we're within valid ranges
-        f0 = max(10.0, min(fs/2 * 0.95, f0))
-        
-        # Shelf filter calculations from Audio EQ Cookbook
-        A = 10**(gain_db/40.0)  # Linear amplitude
-        w0 = 2 * np.pi * f0 / fs
-        cos_w0 = np.cos(w0)
-        sin_w0 = np.sin(w0)
-        alpha = sin_w0 / 2 * np.sqrt((A + 1/A) * (1/0.707 - 1) + 2)
-        
-        # Low shelf filter coefficients
-        if gain_db >= 0:  # Boost
-            b0 = A * ((A + 1) - (A - 1) * cos_w0 + 2 * np.sqrt(A) * alpha)
-            b1 = 2 * A * ((A - 1) - (A + 1) * cos_w0)
-            b2 = A * ((A + 1) - (A - 1) * cos_w0 - 2 * np.sqrt(A) * alpha)
-            a0 = (A + 1) + (A - 1) * cos_w0 + 2 * np.sqrt(A) * alpha
-            a1 = -2 * ((A - 1) + (A + 1) * cos_w0)
-            a2 = (A + 1) + (A - 1) * cos_w0 - 2 * np.sqrt(A) * alpha
-        else:  # Cut
-            b0 = (A + 1) - (A - 1) * cos_w0 + 2 * np.sqrt(A) * alpha
-            b1 = 2 * ((A - 1) - (A + 1) * cos_w0)
-            b2 = (A + 1) - (A - 1) * cos_w0 - 2 * np.sqrt(A) * alpha
-            a0 = A * ((A + 1) + (A - 1) * cos_w0 + 2 * np.sqrt(A) * alpha)
-            a1 = -2 * A * ((A - 1) + (A + 1) * cos_w0)
-            a2 = A * ((A + 1) + (A - 1) * cos_w0 - 2 * np.sqrt(A) * alpha)
-        
-        # Normalize by a0
-        b = cp.array([b0/a0, b1/a0, b2/a0], dtype=cp.float32)
-        a = cp.array([1.0, a1/a0, a2/a0], dtype=cp.float32)
-    except Exception as e:
-        logger.warning(f"Error creating shelf filter: {e}, using fallback coefficients")
-        # Fallback to safe coefficients for 75Hz +3dB shelf at 48kHz
-        if gain_db >= 0:
-            b = cp.array([1.059, -2.080, 1.026], dtype=cp.float32)
-            a = cp.array([1.0, -1.978, 0.9789], dtype=cp.float32)
-        else:
-            b = cp.array([0.946, -1.878, 0.937], dtype=cp.float32)
-            a = cp.array([1.0, -1.878, 0.937], dtype=cp.float32)
+    # Convert cutoff to normalized frequency
+    nyquist = sample_rate / 2
+    normalized_cutoff = cutoff / nyquist
+    
+    # Use second-order butterworth filter approximation
+    # This is a simple approximation of a shelf filter
+    if gain_db > 0:
+        # Low shelf boost (for brown noise enhancement)
+        b, a = cusignal.butter(2, normalized_cutoff, 'low')
+        gain_linear = 10 ** (gain_db / 20.0)
+        b = b * gain_linear
+    else:
+        # High shelf cut (not used here but included for completeness)
+        b, a = cusignal.butter(2, normalized_cutoff, 'high')
+        gain_linear = 10 ** (-gain_db / 20.0)
+        b = b * gain_linear
     
     # Cache the result
     _filter_cache['brown_shelf'][cache_key] = (b, a)
@@ -387,17 +286,21 @@ def warmth_to_color_mix(warmth):
         'brown': brown
     })
 
-# Noise configuration dataclass - SIMPLIFIED: removed toggles for DSP features
+# Noise configuration dataclass
 class NoiseConfig:
     def __init__(self, 
                  seed=None, 
                  duration=600,
                  color_mix=None,
                  warmth=None, 
-                 rms_target=None, 
-                 peak_ceiling=None,
+                 rms_target=-63.0, 
+                 peak_ceiling=-3.0,
                  lfo_rate=None, 
-                 sample_rate=SAMPLE_RATE):
+                 sample_rate=SAMPLE_RATE, 
+                 profile="baby-safe",
+                 natural_modulation=True,  # Enable subtle natural modulation
+                 haas_effect=True,         # Enable Haas effect for stereo enhancement
+                 enhanced_stereo=True):    # Enable enhanced stereo decorrelation
         """Initialize noise configuration"""
         self.seed = seed if seed is not None else int(time.time())
         self.duration = duration  # seconds
@@ -409,15 +312,17 @@ class NoiseConfig:
         else:
             self.color_mix = color_mix or {'white': 0.4, 'pink': 0.4, 'brown': 0.2}
             
-        # Use YouTube profile settings as default
-        self.rms_target = rms_target if rms_target is not None else NOISE_PROFILE["rms_target"]
-        self.peak_ceiling = peak_ceiling if peak_ceiling is not None else NOISE_PROFILE["peak_ceiling"]
+        self.rms_target = rms_target  # dBFS
+        self.peak_ceiling = peak_ceiling  # dBFS
         self.lfo_rate = lfo_rate  # Hz, None for no modulation
         self.sample_rate = sample_rate
         self.use_gpu = True  # Always use GPU in this version
+        self.profile = profile  # Output profile name
         
-        # Pre-emphasis for YouTube
-        self.pre_emphasis = NOISE_PROFILE["pre_emphasis"]
+        # Stereo enhancement options
+        self.natural_modulation = natural_modulation
+        self.haas_effect = haas_effect
+        self.enhanced_stereo = enhanced_stereo
 
     def validate(self):
         """Validate configuration"""
@@ -448,16 +353,27 @@ class NoiseConfig:
         
         # Normalize color mix to sum to 1.0
         self.color_mix = normalize_color_mix(self.color_mix)
+        
+        # Apply profile settings if needed
+        if self.profile in NOISE_PROFILES:
+            profile_settings = NOISE_PROFILES[self.profile]
+            # Only override if not explicitly set
+            if not hasattr(self, '_custom_rms'):
+                self.rms_target = profile_settings.get("rms_target", self.rms_target)
+            if not hasattr(self, '_custom_peak'):
+                self.peak_ceiling = profile_settings.get("peak_ceiling", self.peak_ceiling)
 
     def set_rms_target(self, value):
         """Set custom RMS target"""
+        self._custom_rms = True
         self.rms_target = value
     
     def set_peak_ceiling(self, value):
         """Set custom peak ceiling"""
+        self._custom_peak = True
         self.peak_ceiling = value
 
-# GPU-accelerated noise generator - SIMPLIFIED: always applies high-quality DSP
+# GPU-accelerated noise generator
 class NoiseGenerator:
     """GPU-accelerated noise generator for rendering to file"""
     
@@ -512,25 +428,19 @@ class NoiseGenerator:
         del warmup
     
     def _init_filters(self):
-        """Initialize enhanced filters for pink and brown noise with improved error handling"""
-        # Create filter coefficients for pink noise - FIR filter for long blocks
-        self._pink_filter_taps = create_pink_filter(4097, self.config.sample_rate)
-        
+        """Initialize enhanced filters for pink and brown noise"""
         # Enhanced pink noise IIR coefficients (8th order) for short blocks
         self._pink_b, self._pink_a = create_pink_iir_coeffs(self.config.sample_rate)
         
         # Initialize IIR filter state for better precision - for stereo
         # Ensure proper dimensions for the filter order
         filter_order = max(len(self._pink_a), len(self._pink_b)) - 1
-        filter_order = max(1, filter_order)  # Ensure at least order 1 for stable initialization
         self._pink_zi_left = cp.zeros(filter_order, dtype=self.precision)
         self._pink_zi_right = cp.zeros(filter_order, dtype=self.precision)
         
-        # Enhanced brown noise filters - use known good filter coefficients
+        # Enhanced brown noise filters
+        # Second-order sections form for better numerical stability in high-pass
         self._brown_hp_sos = create_brown_filters(self.config.sample_rate)
-        
-        # Log the filter shape for debugging
-        logger.debug(f"Brown HP filter shape: {self._brown_hp_sos.shape}")
         
         # Create shelf filter for enhanced brown noise low end
         self._brown_shelf_b, self._brown_shelf_a = create_shelf_filter(
@@ -545,16 +455,16 @@ class NoiseGenerator:
         self._brown_a = cp.array([1.0, -alpha], dtype=self.precision)
         
         # Initialize brown noise filter states for both channels
-        # We don't need to worry about SOS filter states since we're using direct filtering
-        # Ensure filter states have proper dimensions
-        brown_order = max(1, len(self._brown_a) - 1)  # Ensure at least order 1
+        brown_order = max(len(self._brown_a), len(self._brown_b)) - 1
         self._brown_zi_left = cp.zeros(brown_order, dtype=self.precision)
         self._brown_zi_right = cp.zeros(brown_order, dtype=self.precision)
         
-        # For shelf filters
-        shelf_order = max(1, len(self._brown_shelf_a) - 1)  # Ensure at least order 1
-        self._brown_shelf_zi_left = cp.zeros(shelf_order, dtype=self.precision)
-        self._brown_shelf_zi_right = cp.zeros(shelf_order, dtype=self.precision)
+        # For SOS filters, state is per section, with 2 values per section
+        self._brown_hp_zi_left = cp.zeros((self._brown_hp_sos.shape[0], 2), dtype=self.precision)
+        self._brown_hp_zi_right = cp.zeros((self._brown_hp_sos.shape[0], 2), dtype=self.precision)
+        
+        self._brown_shelf_zi_left = cp.zeros(max(len(self._brown_shelf_a), len(self._brown_shelf_b))-1, dtype=self.precision)
+        self._brown_shelf_zi_right = cp.zeros(max(len(self._brown_shelf_a), len(self._brown_shelf_b))-1, dtype=self.precision)
         
         # Create frequency-dependent phase shifts for stereo decorrelation
         # Get block size and frequency resolution
@@ -565,20 +475,26 @@ class NoiseGenerator:
         # Initialize phases array
         self.decorrelation_phases = cp.zeros(n_freqs, dtype=cp.complex64)
         
-        # Enhanced frequency-dependent decorrelation
-        phases = cp.zeros(n_freqs, dtype=self.precision)
-        
-        # Calculate frequency bin indices correctly using frequency resolution
-        low_freq_idx = int(300 / freq_resolution)
-        mid_freq_idx = int(1500 / freq_resolution)
-        
-        # Progressive phase shift based on frequency bands
-        # Less decorrelation in bass for better mono compatibility
-        phases[:low_freq_idx] = cp.linspace(0, cp.pi/8, low_freq_idx)         # 0-22.5 degrees
-        phases[low_freq_idx:mid_freq_idx] = cp.linspace(cp.pi/8, cp.pi/4,     # 22.5-45 degrees
-                                                    mid_freq_idx-low_freq_idx)
-        phases[mid_freq_idx:] = cp.linspace(cp.pi/4, cp.pi/2.5,                # 45-72 degrees
-                                        n_freqs-mid_freq_idx)
+        if self.config.enhanced_stereo:
+            # Enhanced frequency-dependent decorrelation
+            phases = cp.zeros(n_freqs, dtype=self.precision)
+            
+            # Calculate frequency bin indices correctly using frequency resolution
+            low_freq_idx = int(300 / freq_resolution)
+            mid_freq_idx = int(1500 / freq_resolution)
+            
+            # Progressive phase shift based on frequency bands
+            # Less decorrelation in bass for better mono compatibility
+            phases[:low_freq_idx] = cp.linspace(0, cp.pi/8, low_freq_idx)         # 0-22.5 degrees
+            phases[low_freq_idx:mid_freq_idx] = cp.linspace(cp.pi/8, cp.pi/4,     # 22.5-45 degrees
+                                                        mid_freq_idx-low_freq_idx)
+            phases[mid_freq_idx:] = cp.linspace(cp.pi/4, cp.pi/2.5,                # 45-72 degrees
+                                            n_freqs-mid_freq_idx)
+        else:
+            # Original simple decorrelation (linear 0-45 degrees)
+            phases = cp.linspace(0, cp.pi/4, n_freqs)  # 0 to 45 degrees
+            # Apply quadratic curve to phase differences (more in mids and highs)
+            phases = phases**2 / (cp.pi/4)
             
         # Convert phase shifts to complex exponentials for FFT multiplication
         self.decorrelation_phases = cp.exp(1j * phases)
@@ -591,27 +507,7 @@ class NoiseGenerator:
         return self._white_buffer[:, :block_size]
     
     def _apply_pink_filter(self, white_noise, block_size):
-        """Apply pink filter to white noise on GPU"""
-        # For small blocks or short renders, use the faster IIR filter
-        if block_size < 32768:
-            return self._apply_pink_filter_iir(white_noise, block_size)
-            
-        # Process stereo channels
-        left = white_noise[0, :block_size]
-        right = white_noise[1, :block_size]
-        
-        # Process each channel
-        self._pink_buffer[0, :block_size] = cusignal.fftconvolve(
-            left, self._pink_filter_taps, mode='same'
-        )
-        self._pink_buffer[1, :block_size] = cusignal.fftconvolve(
-            right, self._pink_filter_taps, mode='same'
-        )
-        
-        return self._pink_buffer[:, :block_size]
-    
-    def _apply_pink_filter_iir(self, white_noise, block_size):
-        """Apply enhanced pink filter using 8th order IIR approximation (faster for short blocks)"""
+        """Apply pink filter to white noise using IIR implementation"""
         # Process left channel
         left = white_noise[0, :block_size]
         right = white_noise[1, :block_size]
@@ -629,119 +525,39 @@ class NoiseGenerator:
         
         return self._pink_buffer[:, :block_size]
     
-    def _apply_pink_filter_spectral(self, white_noise, block_size):
-        """Apply pink filter using direct spectral shaping for optimal performance
-        
-        This implementation:
-        1. Converts white noise to frequency domain
-        2. Applies 1/sqrt(f) spectral shaping (the pink noise characteristic)
-        3. Adds frequency-domain normalization for consistent levels
-        4. Converts back to time domain
-        """
-        # Process stereo channels
-        left = white_noise[0, :block_size]
-        right = white_noise[1, :block_size]
-        
-        # Convert to frequency domain
-        left_fft = cufft.rfft(left)
-        right_fft = cufft.rfft(right)
-        
-        # Calculate frequency bin indices
-        n_bins = len(left_fft)
-        
-        # Check cache for the spectral filter
-        cache_key = (n_bins, self.config.sample_rate)
-        if cache_key in _filter_cache['pink_spectrum']:
-            # Use cached spectrum
-            pink_filter = _filter_cache['pink_spectrum'][cache_key]
-        else:
-            # Calculate frequency array and handle DC bin specially
-            freqs = cp.arange(n_bins) * (self.config.sample_rate / (2 * block_size))
-            freqs[0] = freqs[1]  # Avoid division by zero
-            
-            # Create 1/sqrt(f) filter (pink noise has 1/f power spectrum)
-            pink_filter = 1.0 / cp.sqrt(freqs)
-            
-            # Apply gentle EQ curve for more natural sound
-            # Reduce extreme low and high end slightly
-            low_shelf = 1.0 / (1.0 + (30.0 / freqs)**1.0)
-            high_shelf = 1.0 / (1.0 + (freqs / 18000.0)**1.0)
-            pink_filter = pink_filter * low_shelf * high_shelf
-            
-            # Normalize to maintain overall power
-            pink_filter = pink_filter / cp.sqrt(cp.mean(pink_filter**2))
-            
-            # Cache for reuse
-            _filter_cache['pink_spectrum'][cache_key] = pink_filter
-        
-        # Apply spectral filter to both channels
-        left_fft_pink = left_fft * pink_filter
-        right_fft_pink = right_fft * pink_filter
-        
-        # Convert back to time domain
-        self._pink_buffer[0, :block_size] = cufft.irfft(left_fft_pink, n=block_size)
-        self._pink_buffer[1, :block_size] = cufft.irfft(right_fft_pink, n=block_size)
-        
-        return self._pink_buffer[:, :block_size]
-    
     def _generate_brown_noise(self, white_noise, block_size):
-        """Generate enhanced brown noise from white noise (stereo) with improved reliability
-        
-        This implementation:
-        1. Applies leaky integrator for 1/f² spectrum (basic brown noise)
-        2. Applies low-shelf EQ for enhanced low end (+3dB @ 75Hz)
-        3. Applies high-pass filter to remove DC offset (~20Hz cutoff)
-        """
-        # Get left and right channels
+        """Generate enhanced brown noise from white noise (stereo)"""
+        # Process left channel
         left = white_noise[0, :block_size]
         right = white_noise[1, :block_size]
         
-        # Step 1: Apply leaky integrator filter to create 1/f² spectrum (basic brown noise)
-        try:
-            # Process left channel with leaky integrator
-            left_brown, self._brown_zi_left = cusignal.lfilter(
-                self._brown_b, self._brown_a, left, zi=self._brown_zi_left
-            )
-            
-            # Process right channel with leaky integrator
-            right_brown, self._brown_zi_right = cusignal.lfilter(
-                self._brown_b, self._brown_a, right, zi=self._brown_zi_right
-            )
-        except Exception as e:
-            logger.warning(f"Brown noise leaky integrator failed: {e}")
-            # Fallback to basic leaky integration without filter state
-            left_brown = cusignal.lfilter(self._brown_b, self._brown_a, left)
-            right_brown = cusignal.lfilter(self._brown_b, self._brown_a, right)
+        # Process left channel
+        # First-order leaky integrator
+        left_brown, self._brown_zi_left = cusignal.lfilter(
+            self._brown_b, self._brown_a, left, zi=self._brown_zi_left)
         
-        # Step 2: Apply low-shelf filter to enhance the low end (adds +3dB at 75Hz)
-        try:
-            # Process left channel with shelf filter
-            left_brown, self._brown_shelf_zi_left = cusignal.lfilter(
-                self._brown_shelf_b, self._brown_shelf_a, left_brown, zi=self._brown_shelf_zi_left
-            )
-            
-            # Process right channel with shelf filter
-            right_brown, self._brown_shelf_zi_right = cusignal.lfilter(
-                self._brown_shelf_b, self._brown_shelf_a, right_brown, zi=self._brown_shelf_zi_right
-            )
-        except Exception as e:
-            logger.warning(f"Brown noise shelf filter failed: {e}")
-            # Fallback to basic filtering without filter state
-            left_brown = cusignal.lfilter(self._brown_shelf_b, self._brown_shelf_a, left_brown)
-            right_brown = cusignal.lfilter(self._brown_shelf_b, self._brown_shelf_a, right_brown)
+        # Apply low-shelf filter for enhanced low-end
+        left_brown, self._brown_shelf_zi_left = cusignal.lfilter(
+            self._brown_shelf_b, self._brown_shelf_a, left_brown, zi=self._brown_shelf_zi_left)
         
-        # Step 3: Apply high-pass filter to remove DC offset (20Hz cutoff)
-        # Using simple SOS filtering without filter state for maximum reliability
-        try:
-            # Use robust SOS filtering without state management
-            left_brown = cusignal.sosfilt(self._brown_hp_sos, left_brown)
-            right_brown = cusignal.sosfilt(self._brown_hp_sos, right_brown)
-        except Exception as e:
-            logger.warning(f"Brown noise SOS HP filter failed: {e}")
-            # If SOS filtering fails, we can still use the brown noise without HP filtering
-            # The leaky integrator already creates most of the brown noise characteristic
+        # Apply high-pass to remove DC offset
+        left_brown, self._brown_hp_zi_left = cusignal.sosfilt(
+            self._brown_hp_sos, left_brown, zi=self._brown_hp_zi_left)
         
-        # Store the results
+        # Process right channel
+        # First-order leaky integrator
+        right_brown, self._brown_zi_right = cusignal.lfilter(
+            self._brown_b, self._brown_a, right, zi=self._brown_zi_right)
+        
+        # Apply low-shelf filter for enhanced low-end
+        right_brown, self._brown_shelf_zi_right = cusignal.lfilter(
+            self._brown_shelf_b, self._brown_shelf_a, right_brown, zi=self._brown_shelf_zi_right)
+        
+        # Apply high-pass to remove DC offset
+        right_brown, self._brown_hp_zi_right = cusignal.sosfilt(
+            self._brown_hp_sos, right_brown, zi=self._brown_hp_zi_right)
+        
+        # Store results
         self._brown_buffer[0, :block_size] = left_brown
         self._brown_buffer[1, :block_size] = right_brown
         
@@ -758,17 +574,7 @@ class NoiseGenerator:
         right_fft = cufft.rfft(right)
         
         # Apply phase shift for decorrelation
-        # Ensure decorrelation phases array is the right length
-        phase_len = len(right_fft)
-        if len(self.decorrelation_phases) < phase_len:
-            # Extend phases array if needed
-            logger.debug(f"Extending decorrelation phases from {len(self.decorrelation_phases)} to {phase_len}")
-            # Create new phases that match the needed length
-            new_phases = cp.linspace(0, cp.pi/4, phase_len)
-            self.decorrelation_phases = cp.exp(1j * new_phases)
-        
-        # Apply phase shift
-        right_fft = right_fft * self.decorrelation_phases[:phase_len]
+        right_fft = right_fft * self.decorrelation_phases[:len(right_fft)]
         
         # Convert back to time domain
         right_decorrelated = cufft.irfft(right_fft, n=len(right))
@@ -780,9 +586,11 @@ class NoiseGenerator:
     
     def _apply_haas_effect(self, noise_block, block_size):
         """Apply subtle Haas effect for enhanced stereo width"""
+        if not self.config.haas_effect:
+            return noise_block
+        
         # Create a subtle delay (5-15ms) for one channel
-        # Note: Keeping delay in ms the same (8ms) despite sample rate change
-        delay_samples = int(0.008 * self.config.sample_rate)  # 8ms delay (384 samples at 48kHz)
+        delay_samples = int(0.008 * self.config.sample_rate)  # 8ms delay
         
         # Only apply to a portion of the spectrum to maintain phase coherence in bass
         
@@ -813,262 +621,65 @@ class NoiseGenerator:
         return noise_block
     
     def _apply_natural_modulation(self, noise_block, block_start_idx, block_size):
-        """Add subtle multi-band modulation for more organic sound
-        
-        This implementation:
-        1. Creates time-varying modulators for different frequency ranges
-        2. Applies modulation in the frequency domain for smoother results
-        3. Uses proper phase offsets to create realistic spatial movement
-        """
-        # Generate time indices for this block with proper time offset
-        t_start = block_start_idx / self.config.sample_rate
-        t = cp.linspace(t_start, t_start + block_size/self.config.sample_rate, block_size, endpoint=False)
-        
-        # Create channel-dependent phase offsets for enhanced stereo effect
-        phase_offset_left = 0.0
-        phase_offset_right = cp.pi / 3  # 60 degree offset gives nice stereo movement
-        
-        # Process each channel with proper phase offsets
-        for ch in range(2):
-            # Use different phase offset for each channel for enhanced stereo
-            ch_phase = phase_offset_right if ch == 1 else phase_offset_left
-            
-            # Convert to frequency domain
-            channel_fft = cufft.rfft(noise_block[ch, :block_size])
-            n_bins = len(channel_fft)
-            
-            # Calculate frequency band boundaries
-            freq_resolution = self.config.sample_rate / block_size
-            low_idx = int(250 / freq_resolution)
-            mid_idx = int(1500 / freq_resolution)
-            high_idx = int(8000 / freq_resolution)
-            
-            # Safety checks for indices
-            low_idx = max(1, min(low_idx, n_bins - 2))
-            mid_idx = max(low_idx + 1, min(mid_idx, n_bins - 1))
-            high_idx = max(mid_idx + 1, min(high_idx, n_bins - 1))
-            
-            # Create modulation curves with proper time-varying behavior
-            # These are the modulation envelopes for each band
-            mod_low = 1.0 + 0.04 * cp.sin(2 * cp.pi * 0.05 * t + ch_phase)
-            mod_mid = 1.0 + 0.03 * cp.sin(2 * cp.pi * 0.11 * t + ch_phase + 0.7)
-            mod_high = 1.0 + 0.02 * cp.sin(2 * cp.pi * 0.17 * t + ch_phase + 1.3)
-            
-            # Create smooth blend regions using frequency domain processing
-            # By modulating magnitude in the frequency domain, we get a more 
-            # natural sound without harsh transitions between frequency bands
-            
-            # Low band modulation curve (fade from full at DC to zero at low_idx)
-            low_curve = cp.ones(n_bins)
-            if low_idx > 1:
-                fade_out = cp.linspace(1, 0, low_idx)
-                low_curve[:low_idx] = fade_out
-            low_curve[low_idx:] = 0
-            
-            # Mid band modulation curve (fade in from low_idx, fade out to high_idx)
-            mid_curve = cp.zeros(n_bins)
-            if mid_idx > low_idx:
-                # Create fade in
-                fade_in_len = min(10, mid_idx - low_idx)
-                if fade_in_len > 0:
-                    fade_in = cp.linspace(0, 1, fade_in_len)
-                    mid_curve[low_idx:low_idx+fade_in_len] = fade_in
-                
-                # Create center section
-                if mid_idx > low_idx + fade_in_len:
-                    mid_curve[low_idx+fade_in_len:mid_idx] = 1.0
-                
-                # Create fade out
-                fade_out_len = min(10, high_idx - mid_idx)
-                if fade_out_len > 0:
-                    fade_out = cp.linspace(1, 0, fade_out_len)
-                    mid_curve[mid_idx:mid_idx+fade_out_len] = fade_out
-            
-            # High band modulation curve (fade in from mid_idx to 1.0)
-            high_curve = cp.zeros(n_bins)
-            if high_idx > mid_idx:
-                fade_in_len = min(10, high_idx - mid_idx)
-                if fade_in_len > 0:
-                    fade_in = cp.linspace(0, 1, fade_in_len)
-                    high_curve[mid_idx:mid_idx+fade_in_len] = fade_in
-                high_curve[mid_idx+fade_in_len:] = 1.0
-            
-            # Create modulated spectrum by applying all three curves
-            # Convert time domain modulation to frequency domain using FFT
-            mod_low_fft = cufft.rfft(mod_low)
-            mod_mid_fft = cufft.rfft(mod_mid)
-            mod_high_fft = cufft.rfft(mod_high)
-            
-            # Extract the magnitude of the channel FFT
-            mag = cp.abs(channel_fft)
-            phase = cp.angle(channel_fft)
-            
-            # Apply modulation to magnitude only (keep phase intact)
-            # This creates a more natural sound without introducing 
-            # phase discontinuities
-            
-            # For each bin, calculate what proportion of each modulator to apply
-            # based on the curves we created
-            for i in range(n_bins):
-                # Calculate weighted average of modulation functions
-                # based on the bin's position in the spectrum
-                if low_curve[i] > 0:
-                    # Get the right value from the modulation FFT
-                    # (wrap around if needed)
-                    mod_idx = i % len(mod_low_fft)
-                    # Modulate the magnitude
-                    mag[i] *= (1.0 + (mod_low_fft[mod_idx].real - 1.0) * low_curve[i])
-                
-                if mid_curve[i] > 0:
-                    mod_idx = i % len(mod_mid_fft)
-                    mag[i] *= (1.0 + (mod_mid_fft[mod_idx].real - 1.0) * mid_curve[i])
-                
-                if high_curve[i] > 0:
-                    mod_idx = i % len(mod_high_fft)
-                    mag[i] *= (1.0 + (mod_high_fft[mod_idx].real - 1.0) * high_curve[i])
-            
-            # Reconstruct complex spectrum with modulated magnitude and original phase
-            channel_fft = mag * cp.exp(1j * phase)
-            
-            # Convert back to time domain
-            noise_block[ch, :block_size] = cufft.irfft(channel_fft, n=block_size)
-        
-        return noise_block
-    
-    def _generate_noise_colors(self, block_size):
-        """Generate only the noise colors needed based on color mix
-        
-        This function optimizes noise generation by only creating the
-        noise types that will actually contribute to the final output.
-        """
-        # Extract color mix weights
-        white_weight = self.config.color_mix.get('white', 0)
-        pink_weight = self.config.color_mix.get('pink', 0)
-        brown_weight = self.config.color_mix.get('brown', 0)
-        
-        # Always generate white noise as base
-        white_noise = self._generate_white_noise_block(block_size)
-        
-        # Special case: pure white noise (skip all processing)
-        if white_weight >= 0.999:
-            return {
-                'white': white_noise,
-                'pink': None,
-                'brown': None
-            }
-        
-        # Initialize noise buffers as needed
-        noise_dict = {'white': white_noise, 'pink': None, 'brown': None}
-        
-        # Only generate pink noise if needed (weight > threshold)
-        if pink_weight > 0.001:
-            # Choose spectral or filter-based generation based on block size
-            if block_size >= 32768:
-                noise_dict['pink'] = self._apply_pink_filter_spectral(white_noise, block_size)
-            else:
-                noise_dict['pink'] = self._apply_pink_filter(white_noise, block_size)
-        
-        # Only generate brown noise if needed (weight > threshold)
-        if brown_weight > 0.001:
-            noise_dict['brown'] = self._generate_brown_noise(white_noise, block_size)
-        
-        return noise_dict
-    
-    def _apply_lfo_modulation(self, noise_block, block_start_idx, block_size):
-        """Apply LFO modulation if enabled"""
-        if not self.config.lfo_rate:
+        """Add subtle multi-band modulation for more organic sound"""
+        if not self.config.natural_modulation:
             return noise_block
-        
-        # Create LFO modulation envelope
+            
+        # Create different modulation rates for different frequency bands
         block_time = block_size / self.config.sample_rate
         
         # Generate time indices for this block
         t_start = block_start_idx / self.config.sample_rate
         t = cp.linspace(t_start, t_start + block_time, block_size, endpoint=False)
         
-        # Create sinusoidal modulation (±1dB)
-        modulation_depth = 10**(1.0/20) - 10**(-1.0/20)  # ±1dB in linear scale
-        modulation = 1.0 + modulation_depth/2 * cp.sin(2 * cp.pi * self.config.lfo_rate * t)
+        # Different modulation rates for different frequency bands
+        # These subtle modulations create a more natural, less static sound
         
-        # Apply same modulation to both channels
-        noise_block[0, :block_size] = noise_block[0, :block_size] * modulation
-        noise_block[1, :block_size] = noise_block[1, :block_size] * modulation
+        # Slow modulation for lows (0.07 Hz)
+        low_mod = 1.0 + 0.02 * cp.sin(2 * cp.pi * 0.07 * t)
+        
+        # Medium modulation for mids (0.13 Hz)
+        mid_mod = 1.0 + 0.015 * cp.sin(2 * cp.pi * 0.13 * t)
+        
+        # Faster modulation for highs (0.27 Hz)
+        high_mod = 1.0 + 0.01 * cp.sin(2 * cp.pi * 0.27 * t)
+        
+        # Process left channel with spectral modulation
+        left_fft = cufft.rfft(noise_block[0, :block_size])
+        
+        # Get frequency bin indices using correct frequency resolution
+        n_bins = len(left_fft)
+        freq_resolution = self.config.sample_rate / block_size
+        low_idx = int(300 / freq_resolution)
+        mid_idx = int(1500 / freq_resolution)
+        
+        # Apply modulation to left channel
+        low_env = cp.linspace(1.0, 0.8, low_idx)
+        left_fft[:low_idx] = left_fft[:low_idx] * (1.0 + 0.03 * cp.sin(2 * cp.pi * 0.05 * t_start) * low_env)
+        
+        mid_env = cp.concatenate([cp.linspace(0.8, 1.0, min(10, low_idx)), 
+                                cp.ones(mid_idx - low_idx - min(10, low_idx))])
+        left_fft[low_idx:mid_idx] = left_fft[low_idx:mid_idx] * (1.0 + 0.02 * cp.sin(2 * cp.pi * 0.13 * t_start) * mid_env)
+        
+        high_env = cp.ones(n_bins - mid_idx)
+        left_fft[mid_idx:] = left_fft[mid_idx:] * (1.0 + 0.01 * cp.sin(2 * cp.pi * 0.21 * t_start) * high_env)
+        
+        # Convert back to time domain
+        noise_block[0, :block_size] = cufft.irfft(left_fft, n=block_size)
+        
+        # Process right channel with phase offset for enhanced decorrelation
+        right_fft = cufft.rfft(noise_block[1, :block_size])
+        
+        # Apply modulation to right channel with phase offset
+        phase_offset = cp.pi / 4  # 45 degree offset
+        right_fft[:low_idx] = right_fft[:low_idx] * (1.0 + 0.03 * cp.sin(2 * cp.pi * 0.05 * t_start + phase_offset) * low_env)
+        right_fft[low_idx:mid_idx] = right_fft[low_idx:mid_idx] * (1.0 + 0.02 * cp.sin(2 * cp.pi * 0.13 * t_start + phase_offset) * mid_env)
+        right_fft[mid_idx:] = right_fft[mid_idx:] * (1.0 + 0.01 * cp.sin(2 * cp.pi * 0.21 * t_start + phase_offset) * high_env)
+        
+        # Convert back to time domain
+        noise_block[1, :block_size] = cufft.irfft(right_fft, n=block_size)
         
         return noise_block
-    
-    def _blend_noise_colors(self, white, pink, brown, color_mix, block_size):
-        """Blend different noise colors on GPU according to color mix"""
-        white_gain = cp.sqrt(color_mix.get('white', 0))
-        pink_gain = cp.sqrt(color_mix.get('pink', 0))
-        brown_gain = cp.sqrt(color_mix.get('brown', 0))
-        
-        # Normalize to ensure consistent levels regardless of mix
-        total_power = white_gain**2 + pink_gain**2 + brown_gain**2
-        normalization = cp.sqrt(1.0 / (total_power + 1e-10))
-        
-        white_gain *= normalization
-        pink_gain *= normalization
-        brown_gain *= normalization
-        
-        # Mix stereo signals (channel-wise)
-        self._mixed_buffer[0, :block_size] = (
-            white[0, :block_size] * white_gain + 
-            (pink[0, :block_size] * pink_gain if pink is not None else 0) + 
-            (brown[0, :block_size] * brown_gain if brown is not None else 0)
-        )
-        
-        self._mixed_buffer[1, :block_size] = (
-            white[1, :block_size] * white_gain + 
-            (pink[1, :block_size] * pink_gain if pink is not None else 0) + 
-            (brown[1, :block_size] * brown_gain if brown is not None else 0)
-        )
-        
-        return self._mixed_buffer[:, :block_size]
-    
-    def generate_block(self, block_size, block_start_idx=0):
-        """Generate a block of noise with the specified configuration"""
-        try:
-            # Generate only the needed noise colors
-            noise_dict = self._generate_noise_colors(block_size)
-            
-            # Blend according to color mix
-            mixed_noise = self._blend_noise_colors(
-                noise_dict['white'], 
-                noise_dict['pink'], 
-                noise_dict['brown'], 
-                self.config.color_mix, 
-                block_size
-            )
-            
-            # Apply enhanced stereo processing (always enabled for best quality)
-            # 1. Apply stereo decorrelation for natural stereo field
-            mixed_noise = self._apply_stereo_decorrelation(mixed_noise, block_size)
-            
-            # 2. Apply Haas effect for enhanced stereo width
-            mixed_noise = self._apply_haas_effect(mixed_noise, block_size)
-                
-            # 3. Apply natural modulation for more organic sound
-            mixed_noise = self._apply_natural_modulation(mixed_noise, block_start_idx, block_size)
-            
-            # Apply LFO modulation if enabled (still optional)
-            mixed_noise = self._apply_lfo_modulation(mixed_noise, block_start_idx, block_size)
-            
-            # Apply multi-stage gain and limiting
-            mixed_noise = self._apply_gain_and_limiting(
-                mixed_noise, self.config.rms_target, self.config.peak_ceiling, block_size
-            )
-            
-            # Apply true-peak limiting
-            mixed_noise = self._apply_true_peak_limiting(mixed_noise, self.config.peak_ceiling, block_size)
-            
-            # Apply pre-emphasis if enabled in profile
-            mixed_noise = self._apply_pre_emphasis(mixed_noise, block_size)
-            
-            return mixed_noise
-        except Exception as e:
-            logger.error(f"Error in generate_block: {e}")
-            # Return silent audio as fallback
-            return cp.zeros((2, block_size), dtype=self.precision)
     
     def _apply_gain_and_limiting(self, noise_block, target_rms, peak_ceiling, block_size):
         """Multi-stage gain and limiting for better sound quality"""
@@ -1209,7 +820,7 @@ class NoiseGenerator:
     
     def _apply_pre_emphasis(self, noise_block, block_size):
         """Apply pre-emphasis filter for better codec performance on YouTube"""
-        if not self.config.pre_emphasis:
+        if not NOISE_PROFILES.get(self.config.profile, {}).get("pre_emphasis", False):
             return noise_block
         
         # Pre-emphasis filter (boost above 5kHz for YouTube codec)
@@ -1239,6 +850,100 @@ class NoiseGenerator:
         noise_block[1, :block_size] = emphasized_right * gain_factor
         
         return noise_block
+    
+    def _apply_lfo_modulation(self, noise_block, block_start_idx, block_size):
+        """Apply LFO modulation if enabled"""
+        if not self.config.lfo_rate:
+            return noise_block
+        
+        # Create LFO modulation envelope
+        block_time = block_size / self.config.sample_rate
+        
+        # Generate time indices for this block
+        t_start = block_start_idx / self.config.sample_rate
+        t = cp.linspace(t_start, t_start + block_time, block_size, endpoint=False)
+        
+        # Create sinusoidal modulation (±1dB)
+        modulation_depth = 10**(1.0/20) - 10**(-1.0/20)  # ±1dB in linear scale
+        modulation = 1.0 + modulation_depth/2 * cp.sin(2 * cp.pi * self.config.lfo_rate * t)
+        
+        # Apply same modulation to both channels
+        noise_block[0, :block_size] = noise_block[0, :block_size] * modulation
+        noise_block[1, :block_size] = noise_block[1, :block_size] * modulation
+        
+        return noise_block
+    
+    def _blend_noise_colors(self, white, pink, brown, color_mix, block_size):
+        """Blend different noise colors on GPU according to color mix"""
+        white_gain = cp.sqrt(color_mix.get('white', 0))
+        pink_gain = cp.sqrt(color_mix.get('pink', 0))
+        brown_gain = cp.sqrt(color_mix.get('brown', 0))
+        
+        # Normalize to ensure consistent levels regardless of mix
+        total_power = white_gain**2 + pink_gain**2 + brown_gain**2
+        normalization = cp.sqrt(1.0 / (total_power + 1e-10))
+        
+        white_gain *= normalization
+        pink_gain *= normalization
+        brown_gain *= normalization
+        
+        # Mix stereo signals (channel-wise)
+        self._mixed_buffer[0, :block_size] = (
+            white[0, :block_size] * white_gain + 
+            pink[0, :block_size] * pink_gain + 
+            brown[0, :block_size] * brown_gain
+        )
+        
+        self._mixed_buffer[1, :block_size] = (
+            white[1, :block_size] * white_gain + 
+            pink[1, :block_size] * pink_gain + 
+            brown[1, :block_size] * brown_gain
+        )
+        
+        return self._mixed_buffer[:, :block_size]
+    
+    def generate_block(self, block_size, block_start_idx=0):
+        """Generate a block of noise with the specified configuration"""
+        # Generate white noise base
+        white_noise = self._generate_white_noise_block(block_size)
+        
+        # Generate pink noise from white noise
+        pink_noise = self._apply_pink_filter(white_noise, block_size)
+        
+        # Generate brown noise from white noise
+        brown_noise = self._generate_brown_noise(white_noise, block_size)
+        
+        # Blend according to color mix
+        mixed_noise = self._blend_noise_colors(
+            white_noise, pink_noise, brown_noise, self.config.color_mix, block_size
+        )
+        
+        # Apply stereo decorrelation
+        mixed_noise = self._apply_stereo_decorrelation(mixed_noise, block_size)
+        
+        # Apply Haas effect for enhanced stereo imaging if enabled
+        if self.config.haas_effect:
+            mixed_noise = self._apply_haas_effect(mixed_noise, block_size)
+            
+        # Apply natural modulation for more organic sound if enabled
+        if self.config.natural_modulation:
+            mixed_noise = self._apply_natural_modulation(mixed_noise, block_start_idx, block_size)
+        
+        # Apply LFO modulation if enabled
+        mixed_noise = self._apply_lfo_modulation(mixed_noise, block_start_idx, block_size)
+        
+        # Apply multi-stage gain and limiting
+        mixed_noise = self._apply_gain_and_limiting(
+            mixed_noise, self.config.rms_target, self.config.peak_ceiling, block_size
+        )
+        
+        # Apply true-peak limiting
+        mixed_noise = self._apply_true_peak_limiting(mixed_noise, self.config.peak_ceiling, block_size)
+        
+        # Apply pre-emphasis if enabled in profile
+        mixed_noise = self._apply_pre_emphasis(mixed_noise, block_size)
+        
+        return mixed_noise
     
     def _adjust_block_size(self, current_size, free_memory, used_memory):
         """Adaptively adjust block size based on memory usage"""
@@ -1362,37 +1067,23 @@ class NoiseGenerator:
                     
                     # Apply overlap from previous block if available
                     if overlap_buffer is not None:
-                        # Make sure overlap is valid
-                        overlap = min(overlap, len(overlap_buffer), len(output_data))
+                        # Crossfade with previous block's overlap region
+                        # Make sure the fade arrays are properly shaped for broadcasting
+                        fade_in_shaped = self._fade_in[:overlap, np.newaxis]
+                        fade_out_shaped = self._fade_out[:overlap, np.newaxis]
                         
-                        if overlap > 0:
-                            # Crossfade with previous block's overlap region
-                            # Make sure the fade arrays are properly shaped for broadcasting
-                            fade_in = self._fade_in[:overlap]
-                            fade_out = self._fade_out[:overlap]
-                            
-                            # Reshape for broadcasting
-                            fade_in_shaped = fade_in.reshape(-1, 1)
-                            fade_out_shaped = fade_out.reshape(-1, 1)
-                            
-                            # Apply crossfade
-                            output_data[:overlap, :] = (
-                                output_data[:overlap, :] * fade_in_shaped + 
-                                overlap_buffer[:overlap, :] * fade_out_shaped
-                            )
+                        output_data[:overlap, :] = (
+                            output_data[:overlap, :] * fade_in_shaped + 
+                            overlap_buffer[:overlap, :] * fade_out_shaped
+                        )
                     
                     # Save overlap buffer for next iteration - ensure explicit array conversion
-                    if samples_remaining > overlap and overlap > 0:
-                        # Ensure we don't try to copy more than we have
-                        last_overlap = min(overlap, len(output_data))
-                        if last_overlap > 0:
-                            overlap_buffer = np.array(output_data[-last_overlap:, :].copy())
+                    if samples_remaining > overlap:
+                        overlap_buffer = np.array(output_data[-overlap:, :].copy())
                     
                     # Write to file (excluding overlap for next block)
                     write_length = min(len(output_data) - overlap, samples_remaining)
-                    # Ensure we don't write more samples than we have
-                    if write_length > 0:
-                        f.write(output_data[:write_length])
+                    f.write(output_data[:write_length])
                     
                     # Update progress
                     samples_written += write_length
@@ -1515,8 +1206,13 @@ def load_preset(preset_name):
     default_presets = {
         "default": {
             "color_mix": {'white': 0.4, 'pink': 0.4, 'brown': 0.2},
-            "rms_target": -20.0,
+            "rms_target": -63.0,
             "lfo_rate": 0.1
+        },
+        "newborn_deep": {
+            "color_mix": {'white': 0.2, 'pink': 0.3, 'brown': 0.5},
+            "rms_target": -65.0,
+            "lfo_rate": 0.05
         },
         "youtube": {
             "color_mix": {'white': 0.4, 'pink': 0.4, 'brown': 0.2},
@@ -1525,17 +1221,17 @@ def load_preset(preset_name):
         },
         "white_only": {
             "color_mix": {'white': 1.0, 'pink': 0.0, 'brown': 0.0},
-            "rms_target": -20.0,
+            "rms_target": -63.0,
             "lfo_rate": 0.1
         },
         "pink_only": {
             "color_mix": {'white': 0.0, 'pink': 1.0, 'brown': 0.0},
-            "rms_target": -20.0,
+            "rms_target": -63.0,
             "lfo_rate": 0.1
         },
         "brown_only": {
             "color_mix": {'white': 0.0, 'pink': 0.0, 'brown': 1.0},
-            "rms_target": -20.0,
+            "rms_target": -63.0,
             "lfo_rate": 0.1
         }
     }
@@ -1556,13 +1252,15 @@ def load_preset(preset_name):
     return presets[preset_name]
 
 def main():
-    """Main entry point for the headless Noise Generator"""
+    """Main entry point for the headless Baby-Noise Generator"""
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Noise Generator v2.0.5 - Simplified DSP for YouTube (Headless)")
+    parser = argparse.ArgumentParser(description="Baby-Noise Generator v2.0.2 - Enhanced DSP (Headless)")
     
-    # Key parameters - stereo always enabled
-    parser.add_argument("--output", type=str, help="Output file path (WAV or FLAC)", default="noise_output.wav")
+    # Key parameters - removed channels parameter, now always stereo
+    parser.add_argument("--output", type=str, help="Output file path (WAV or FLAC)", default="baby_noise.wav")
     parser.add_argument("--duration", type=int, help="Duration in seconds", default=600)
+    parser.add_argument("--profile", type=str, choices=["baby-safe", "youtube-pub"], 
+                        help="Output profile", default="baby-safe")
     
     # Noise characteristics
     parser.add_argument("--warmth", type=float, help="Warmth parameter (0-100)", default=50)
@@ -1576,6 +1274,17 @@ def main():
     parser.add_argument("--preset", type=str, help="Load a preset configuration", default=None)
     parser.add_argument("--rms", type=float, help="Target RMS level in dBFS", default=None)
     parser.add_argument("--peak", type=float, help="True-peak ceiling (dBFS)", default=None)
+    
+    # Enhanced audio quality options - stereo-specific options kept
+    parser.add_argument("--natural-mod", action="store_true", help="Enable natural modulation for more organic sound")
+    parser.add_argument("--no-natural-mod", action="store_false", dest="natural_mod", help="Disable natural modulation")
+    parser.add_argument("--haas", action="store_true", help="Enable Haas effect for enhanced stereo width")
+    parser.add_argument("--no-haas", action="store_false", dest="haas", help="Disable Haas effect")
+    parser.add_argument("--enhanced-stereo", action="store_true", help="Enable enhanced stereo decorrelation")
+    parser.add_argument("--no-enhanced-stereo", action="store_false", dest="enhanced_stereo", help="Use basic stereo decorrelation")
+    
+    # Set defaults for enhanced options
+    parser.set_defaults(natural_mod=True, haas=True, enhanced_stereo=True)
     
     # Output options
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
@@ -1630,13 +1339,17 @@ def main():
         color_mix = preset_config["color_mix"]
         logger.info(f"Using preset color mix: {color_mix}")
     
-    # Create simplified configuration (no more enhanced stereo toggles)
+    # Create configuration with enhanced stereo options
     config = NoiseConfig(
         seed=seed,
         duration=args.duration,
         color_mix=color_mix,
         warmth=args.warmth if color_mix is None else None,
-        lfo_rate=args.lfo if args.lfo is not None else preset_config.get("lfo_rate")
+        profile=args.profile,
+        lfo_rate=args.lfo if args.lfo is not None else preset_config.get("lfo_rate"),
+        natural_modulation=args.natural_mod,
+        haas_effect=args.haas,
+        enhanced_stereo=args.enhanced_stereo
     )
     
     # Override with explicit RMS if provided
@@ -1652,17 +1365,17 @@ def main():
     # Print configuration summary
     logger.info(f"Generating {args.duration}s of stereo noise...")
     logger.info(f"Output: {args.output}")
+    logger.info(f"Profile: {args.profile}")
     if color_mix is None:
         logger.info(f"Warmth: {args.warmth}%")
     else:
         logger.info(f"Color mix: white={color_mix['white']:.2f}, pink={color_mix['pink']:.2f}, brown={color_mix['brown']:.2f}")
     logger.info(f"Seed: {seed}")
     
-    # Log integrated DSP features
-    logger.info("Using integrated high-quality DSP features:")
-    logger.info("- Enhanced stereo decorrelation for natural stereo field")
-    logger.info("- Haas effect for enhanced width with bass protection")
-    logger.info("- Natural modulation for organic sound character")
+    # Log stereo enhancement options
+    logger.info(f"Enhanced stereo: {'ON' if args.enhanced_stereo else 'OFF'}")
+    logger.info(f"Haas effect: {'ON' if args.haas else 'OFF'}")
+    logger.info(f"Natural modulation: {'ON' if args.natural_mod else 'OFF'}")
     
     # Check for pyloudnorm availability for accurate LUFS measurement
     try:
