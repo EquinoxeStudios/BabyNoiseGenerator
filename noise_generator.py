@@ -51,22 +51,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("baby-noise-app")
 
-# Output profiles with specific settings
-NOISE_PROFILES = {
-    "baby-safe": {
-        "rms_target": -63.0,        # Default RMS level (AAP guideline)
-        "lufs_threshold": -27.0,    # LUFS threshold (approx AAP guideline)
-        "peak_ceiling": -3.0,       # True peak ceiling
-        "pre_emphasis": False,      # No pre-emphasis needed
-        "description": "AAP-compliant safe levels"
-    },
-    "youtube-pub": {
-        "rms_target": -20.0,        # Higher RMS for YouTube
-        "lufs_threshold": -16.0,    # LUFS threshold for YouTube
-        "peak_ceiling": -2.0,       # Less headroom needed
-        "pre_emphasis": True,       # Add pre-emphasis for codec resilience
-        "description": "Optimized for YouTube publishing"
-    }
+# Output profile for YouTube publishing (only profile now)
+YOUTUBE_PROFILE = {
+    "rms_target": -20.0,        # Higher RMS for YouTube
+    "lufs_threshold": -16.0,    # LUFS threshold for YouTube
+    "peak_ceiling": -2.0,       # Less headroom needed
+    "pre_emphasis": True,       # Add pre-emphasis for codec resilience
+    "description": "Optimized for YouTube publishing"
 }
 
 # Cache for device info - initialized once and reused
@@ -215,11 +206,10 @@ class NoiseConfig:
                  duration=600,
                  color_mix=None,
                  warmth=None, 
-                 rms_target=-63.0, 
-                 peak_ceiling=-3.0,
+                 rms_target=None, 
+                 peak_ceiling=None,
                  lfo_rate=None, 
                  sample_rate=SAMPLE_RATE, 
-                 profile="baby-safe",
                  natural_modulation=True,  # Enable subtle natural modulation
                  haas_effect=True,         # Enable Haas effect for stereo enhancement
                  enhanced_stereo=True):    # Enable enhanced stereo decorrelation
@@ -234,12 +224,15 @@ class NoiseConfig:
         else:
             self.color_mix = color_mix or {'white': 0.4, 'pink': 0.4, 'brown': 0.2}
             
-        self.rms_target = rms_target  # dBFS
-        self.peak_ceiling = peak_ceiling  # dBFS
+        # Use YouTube profile values by default if not explicitly set
+        self.rms_target = rms_target if rms_target is not None else YOUTUBE_PROFILE["rms_target"]
+        self.peak_ceiling = peak_ceiling if peak_ceiling is not None else YOUTUBE_PROFILE["peak_ceiling"]
+        self.lufs_threshold = YOUTUBE_PROFILE["lufs_threshold"]
+        self.pre_emphasis = YOUTUBE_PROFILE["pre_emphasis"]
+            
         self.lfo_rate = lfo_rate  # Hz, None for no modulation
         self.sample_rate = sample_rate
         self.use_gpu = True  # Always use GPU in this version
-        self.profile = profile  # Output profile name
         
         # Stereo enhancement options
         self.natural_modulation = natural_modulation
@@ -275,24 +268,13 @@ class NoiseConfig:
         
         # Normalize color mix to sum to 1.0
         self.color_mix = normalize_color_mix(self.color_mix)
-        
-        # Apply profile settings if needed
-        if self.profile in NOISE_PROFILES:
-            profile_settings = NOISE_PROFILES[self.profile]
-            # Only override if not explicitly set
-            if not hasattr(self, '_custom_rms'):
-                self.rms_target = profile_settings.get("rms_target", self.rms_target)
-            if not hasattr(self, '_custom_peak'):
-                self.peak_ceiling = profile_settings.get("peak_ceiling", self.peak_ceiling)
 
     def set_rms_target(self, value):
         """Set custom RMS target"""
-        self._custom_rms = True
         self.rms_target = value
     
     def set_peak_ceiling(self, value):
         """Set custom peak ceiling"""
-        self._custom_peak = True
         self.peak_ceiling = value
 
 # GPU-accelerated noise generator
@@ -818,7 +800,7 @@ class NoiseGenerator:
     
     def _apply_pre_emphasis(self, noise_block, block_size):
         """Apply pre-emphasis filter for better codec performance on YouTube"""
-        if not NOISE_PROFILES.get(self.config.profile, {}).get("pre_emphasis", False):
+        if not self.config.pre_emphasis:
             return noise_block
         
         # Pre-emphasis filter (boost above 5kHz for YouTube codec)
@@ -1223,32 +1205,22 @@ def load_preset(preset_name):
     default_presets = {
         "default": {
             "color_mix": {'white': 0.4, 'pink': 0.4, 'brown': 0.2},
-            "rms_target": -63.0,
-            "lfo_rate": 0.1
-        },
-        "newborn_deep": {
-            "color_mix": {'white': 0.2, 'pink': 0.3, 'brown': 0.5},
-            "rms_target": -65.0,
-            "lfo_rate": 0.05
-        },
-        "youtube": {
-            "color_mix": {'white': 0.4, 'pink': 0.4, 'brown': 0.2},
-            "rms_target": -20.0,
+            "rms_target": -20.0,  # YouTube standard level
             "lfo_rate": 0.1
         },
         "white_only": {
             "color_mix": {'white': 1.0, 'pink': 0.0, 'brown': 0.0},
-            "rms_target": -63.0,
+            "rms_target": -20.0,  # YouTube standard level
             "lfo_rate": 0.1
         },
         "pink_only": {
             "color_mix": {'white': 0.0, 'pink': 1.0, 'brown': 0.0},
-            "rms_target": -63.0,
+            "rms_target": -20.0,  # YouTube standard level
             "lfo_rate": 0.1
         },
         "brown_only": {
             "color_mix": {'white': 0.0, 'pink': 0.0, 'brown': 1.0},
-            "rms_target": -63.0,
+            "rms_target": -20.0,  # YouTube standard level
             "lfo_rate": 0.1
         }
     }
@@ -1276,8 +1248,6 @@ def main():
     # Key parameters - removed channels parameter, now always stereo
     parser.add_argument("--output", type=str, help="Output file path (WAV or FLAC)", default="baby_noise.wav")
     parser.add_argument("--duration", type=int, help="Duration in seconds", default=600)
-    parser.add_argument("--profile", type=str, choices=["baby-safe", "youtube-pub"], 
-                        help="Output profile", default="baby-safe")
     
     # Noise characteristics
     parser.add_argument("--warmth", type=float, help="Warmth parameter (0-100)", default=50)
@@ -1362,27 +1332,18 @@ def main():
         duration=args.duration,
         color_mix=color_mix,
         warmth=args.warmth if color_mix is None else None,
-        profile=args.profile,
+        rms_target=args.rms if args.rms is not None else preset_config.get("rms_target"),
+        peak_ceiling=args.peak,
         lfo_rate=args.lfo if args.lfo is not None else preset_config.get("lfo_rate"),
         natural_modulation=args.natural_mod,
         haas_effect=args.haas,
         enhanced_stereo=args.enhanced_stereo
     )
     
-    # Override with explicit RMS if provided
-    if args.rms is not None:
-        config.set_rms_target(args.rms)
-    elif args.preset and "rms_target" in preset_config:
-        config.set_rms_target(preset_config["rms_target"])
-    
-    # Override with explicit peak ceiling if provided
-    if args.peak is not None:
-        config.set_peak_ceiling(args.peak)
-    
     # Print configuration summary
     logger.info(f"Generating {args.duration}s of stereo noise...")
     logger.info(f"Output: {args.output}")
-    logger.info(f"Profile: {args.profile}")
+    logger.info(f"YouTube-optimized profile: {YOUTUBE_PROFILE['lufs_threshold']} LUFS")
     if color_mix is None:
         logger.info(f"Warmth: {args.warmth}%")
     else:
