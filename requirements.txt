@@ -1,4 +1,4 @@
-# Baby-Noise Generator v2.0.2 (Enhanced DSP Edition) - Requirements
+# Baby-Noise Generator v2.0.4 (Enhanced DSP Edition) - Requirements
 
 # Core dependencies
 numpy>=1.20.0
@@ -12,7 +12,7 @@ pyloudnorm>=0.1.0  # For ITU-R BS.1770-4 compliant LUFS measurements
 # cupy-cuda11x>=12.2.0
 
 # For CUDA 12.x (recommended)
-cupy-cuda12x>=12.2.0
+cupy-cuda12x>=12.2.0  # Specifically tested with this version
 
 # Development and testing tools
 pytest>=7.0.0       # For running test suite

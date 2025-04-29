@@ -1,4 +1,4 @@
-# Python "Baby‑Noise" Generator v2.0.3 – Technical Outline
+# Python "Baby‑Noise" Generator v2.0.4 – Technical Outline
 (GPU-accelerated high-quality white / pink / brown noise for YouTube & cloud services)
 
 ## 1. High‑level goals
@@ -20,7 +20,7 @@ graph TD
   A[White Noise Generation<br><b>GPU PRNG</b>] --> B{Color Mix Analysis}
   B -->|white >0| C[White Noise<br><b>GPU vectorized</b>]
   B -->|pink >0| D[Pink Noise<br><b>FFT-based filtering</b>]
-  B -->|brown >0| E[Brown Noise<br><b>Vectorized IIR filter<br>[scale], [1, -alpha]</b>] --> F[SOS 20 Hz HPF<br><b>Second-order sections</b>]
+  B -->|brown >0| E[Brown Noise<br><b>Vectorized IIR filter<br>[scale], [1, -alpha]</b>] --> F[Fixed-coefficient SOS<br><b>High-reliability filtering</b>]
   
   C --> G[Color Mixing<br><b>normalized by power</b>]
   D --> G
@@ -61,8 +61,8 @@ graph TD
 |-----------|--------|----------------|--------------|
 | White noise | **CuPy/NumPy Philox** counter‑based PRNG – 2²⁵⁶ period | `rng.normal(0, 1, block_size).astype(cp.float32)` | Always generated as base |
 | Pink noise | Frequency-domain filtering with optimized FFT convolution | `cusignal.fftconvolve(white_noise, pink_filter_taps, mode='same')` | Only generated if weight > 0.001 |
-| Brown noise | **Vectorized IIR filtering** | `cusignal.lfilter([scale], [1, -alpha], white_noise)` | Only generated if weight > 0.001 |
-| Brown noise HPF | **Second-order sections filter** | `cusignal.sosfilt(self._brown_hp_sos, brown)` | Improved initialization with fallbacks |
+| Brown noise | **Vectorized IIR filtering** with leaky integrator | `cusignal.lfilter([scale], [1, -alpha], white_noise)` | Only generated if weight > 0.001 |
+| Brown noise HPF | **Fixed-coefficient SOS filter** | `cusignal.sosfilt(fixed_sos_coeffs, brown)` | Reliable pre-calculated coefficients |
 | Stereo decorrelation | Frequency-dependent phase manipulation (0-45°) | `right_fft = right_fft * decorrelation_phases` | Enhanced phase array handling |
 | True-peak limiting | 4x oversampling with FFT-based resampling | `cusignal.resample(noise_block, len(noise_block) * 4)` | Only runs when peak > threshold |
 | Error handling | Comprehensive thread-safe exception handling | `try/except` with fallback silence generation | Added throughout pipeline |
@@ -72,12 +72,13 @@ graph TD
 ### GPU-specific optimization techniques
 * **Intelligent noise generation** that skips processing for unused noise types
 * **Dynamic block sizing** based on available GPU memory
-* **Parallel filter implementation** for stereo channels
+* **Hardcoded filter coefficients** for brown noise to avoid computation failures
+* **Simplified filter processing** for maximum reliability across GPU types
 * **Vectorized operations** for maximum GPU utilization
 * **Efficient FFT planning** with cached filter coefficients
 * **Adaptive progress reporting** with smart throttling
 * **Optimal memory layout** for minimizing transfer overhead
-* **Second-order sections filtering** for improved numerical stability
+* **High-reliability filtering** with pre-calculated coefficients
 * **CuPy scalar conversions** to Python floats for numeric stability
 * **Reduced buffer allocations** for unused noise types
 
@@ -101,9 +102,10 @@ graph TD
 
 ## 6. Error Handling & Robustness
 
-* **Comprehensive error detection** in all filter creation and processing stages
-* **Fallback mechanisms** for every processing stage
-* **Filter validation** before use to prevent dimension errors
+* **Ultra-reliable filter implementation** with fixed pre-calculated coefficients
+* **Simplified filter state management** to avoid dimension and broadcasting errors
+* **Comprehensive error detection** in all processing stages
+* **Fallback mechanisms** for every processing stage 
 * **Thread safety**: Comprehensive exception handling in background threads
 * **Failsafe mechanisms**: Automatic silence generation or white noise fallback on errors
 * **Progress throttling**: Adaptive update frequency based on render duration

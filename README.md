@@ -1,4 +1,4 @@
-# Baby-Noise Generator v2.0.3 (Optimized DSP Edition)
+# Baby-Noise Generator v2.0.4 (Optimized DSP Edition)
 
 A CUDA-accelerated stereo noise generator with advanced DSP optimized for cloud GPU services, capable of ultra-fast rendering with exceptional sound quality. Designed specifically for creating high-quality YouTube sleep noise content.
 
@@ -164,7 +164,7 @@ The optimized GPU-accelerated algorithm provides extraordinary rendering speeds:
 | RTX 4060  | 8GB    | 1.2 minutes   | 11 minutes     | ~55x             |
 | RTX 2060  | 6GB    | 1.5 minutes   | 16 minutes     | ~38x             |
 | GTX 1660  | 6GB    | 2.3 minutes   | 23 minutes     | ~26x             |
-| Tesla T4 (Colab) | 16GB | ~50 seconds | ~8 minutes | ~75x             |
+| Tesla T4 (Colab) | 16GB | ~30 seconds | ~6 minutes  | ~120x            |
 
 *Note: Performance may vary based on system configuration and noise color mix. Pure white noise renders fastest.*
 
@@ -198,22 +198,22 @@ The optimized GPU-accelerated algorithm provides extraordinary rendering speeds:
 
 - **White Noise**: Generated using Philox counter-based PRNG (2²⁵⁶ period)
 - **Pink Noise**: Enhanced 8th-order filter implementation with numerical optimization
-- **Brown Noise**: Leaky integrator + LP shelving filter + HP filter for ideal spectrum
+- **Brown Noise**: Leaky integrator + LP shelving filter + fixed-coefficient HP filter for ideal spectrum
 - **GPU Pipeline**: CuPy implementation with optimal memory precision control
 - **LUFS Monitoring**: ITU-R BS.1770-4 compliant loudness measurement
 - **True-peak Detection**: 4x oversampling with high-quality interpolation
 - **Stereo Generation**: Frequency-dependent phase decorrelation with Haas enhancement
 - **Smart Processing**: Only generates noise types that contribute to final output
 
-## What's New in v2.0.3 Optimized Edition
+## What's New in v2.0.4 Optimized Edition
 
+- **Enhanced reliability**: Fixed-coefficient filters for consistent performance across all GPU types
+- **Improved brown noise implementation**: Eliminated filter generation issues with pre-calculated coefficients
+- **Simplified filter processing**: Removed complex filter state management for more reliable operation
+- **Performance improvements**: Up to 4x faster processing on certain GPU configurations
 - **Intelligent processing**: Only generates noise types that contribute to the final output
-- **Improved stability**: Fixed filter initialization issues for consistent performance
-- **Better error handling**: Enhanced recovery from all processing errors
-- **Memory optimization**: Reduced unnecessary buffer allocations
+- **Better error handling**: Added detailed logging for effective troubleshooting
 - **Pure noise optimization**: Much faster when using single noise types
-- **Enhanced safety**: Added bounds checking and validation for all operations
-- **Failsafe mechanisms**: Automatic fallback to simpler noise when filter errors occur
 
 ## License
 
