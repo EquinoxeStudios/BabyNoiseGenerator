@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Baby-Noise Generator App v2.0.4 - Enhanced DSP Edition (Headless Version)
-# Optimized for sound quality and performance with advanced DSP techniques
+# Baby-Noise Generator App v2.0.5 - Simplified DSP Edition (Headless Version)
+# Optimized for sound quality and performance with integrated advanced DSP techniques
 # Exclusively optimized for GPU acceleration with no CPU fallback
 # Stereo-only version for YouTube publishing
 
@@ -30,7 +30,7 @@ SAMPLE_RATE = 48000          # Use 48 kHz for YouTube optimization (avoids resam
 FFT_BLOCK_SIZE = 2**18       # ~1.36 seconds at 48 kHz (large block optimization)
 BLOCK_OVERLAP = 4096         # For smooth transitions between blocks
 BROWN_LEAKY_ALPHA = 0.999    # Leaky integrator coefficient
-APP_TITLE = "Noise Generator v2.0.4 - Enhanced DSP for YouTube (Headless)"
+APP_TITLE = "Noise Generator v2.0.5 - Simplified DSP for YouTube (Headless)"
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/BabyNoise")
 MIN_DURATION = 1             # Minimum allowed duration in seconds
 MAX_MEMORY_LIMIT_FRACTION = 0.8  # Maximum fraction of GPU memory to use
@@ -387,7 +387,7 @@ def warmth_to_color_mix(warmth):
         'brown': brown
     })
 
-# Noise configuration dataclass
+# Noise configuration dataclass - SIMPLIFIED: removed toggles for DSP features
 class NoiseConfig:
     def __init__(self, 
                  seed=None, 
@@ -397,10 +397,7 @@ class NoiseConfig:
                  rms_target=None, 
                  peak_ceiling=None,
                  lfo_rate=None, 
-                 sample_rate=SAMPLE_RATE, 
-                 natural_modulation=True,  # Enable subtle natural modulation
-                 haas_effect=True,         # Enable Haas effect for stereo enhancement
-                 enhanced_stereo=True):    # Enable enhanced stereo decorrelation
+                 sample_rate=SAMPLE_RATE):
         """Initialize noise configuration"""
         self.seed = seed if seed is not None else int(time.time())
         self.duration = duration  # seconds
@@ -418,11 +415,6 @@ class NoiseConfig:
         self.lfo_rate = lfo_rate  # Hz, None for no modulation
         self.sample_rate = sample_rate
         self.use_gpu = True  # Always use GPU in this version
-        
-        # Stereo enhancement options
-        self.natural_modulation = natural_modulation
-        self.haas_effect = haas_effect
-        self.enhanced_stereo = enhanced_stereo
         
         # Pre-emphasis for YouTube
         self.pre_emphasis = NOISE_PROFILE["pre_emphasis"]
@@ -465,7 +457,7 @@ class NoiseConfig:
         """Set custom peak ceiling"""
         self.peak_ceiling = value
 
-# GPU-accelerated noise generator
+# GPU-accelerated noise generator - SIMPLIFIED: always applies high-quality DSP
 class NoiseGenerator:
     """GPU-accelerated noise generator for rendering to file"""
     
@@ -573,26 +565,20 @@ class NoiseGenerator:
         # Initialize phases array
         self.decorrelation_phases = cp.zeros(n_freqs, dtype=cp.complex64)
         
-        if self.config.enhanced_stereo:
-            # Enhanced frequency-dependent decorrelation
-            phases = cp.zeros(n_freqs, dtype=self.precision)
-            
-            # Calculate frequency bin indices correctly using frequency resolution
-            low_freq_idx = int(300 / freq_resolution)
-            mid_freq_idx = int(1500 / freq_resolution)
-            
-            # Progressive phase shift based on frequency bands
-            # Less decorrelation in bass for better mono compatibility
-            phases[:low_freq_idx] = cp.linspace(0, cp.pi/8, low_freq_idx)         # 0-22.5 degrees
-            phases[low_freq_idx:mid_freq_idx] = cp.linspace(cp.pi/8, cp.pi/4,     # 22.5-45 degrees
-                                                        mid_freq_idx-low_freq_idx)
-            phases[mid_freq_idx:] = cp.linspace(cp.pi/4, cp.pi/2.5,                # 45-72 degrees
-                                            n_freqs-mid_freq_idx)
-        else:
-            # Original simple decorrelation (linear 0-45 degrees)
-            phases = cp.linspace(0, cp.pi/4, n_freqs)  # 0 to 45 degrees
-            # Apply quadratic curve to phase differences (more in mids and highs)
-            phases = phases**2 / (cp.pi/4)
+        # Enhanced frequency-dependent decorrelation
+        phases = cp.zeros(n_freqs, dtype=self.precision)
+        
+        # Calculate frequency bin indices correctly using frequency resolution
+        low_freq_idx = int(300 / freq_resolution)
+        mid_freq_idx = int(1500 / freq_resolution)
+        
+        # Progressive phase shift based on frequency bands
+        # Less decorrelation in bass for better mono compatibility
+        phases[:low_freq_idx] = cp.linspace(0, cp.pi/8, low_freq_idx)         # 0-22.5 degrees
+        phases[low_freq_idx:mid_freq_idx] = cp.linspace(cp.pi/8, cp.pi/4,     # 22.5-45 degrees
+                                                    mid_freq_idx-low_freq_idx)
+        phases[mid_freq_idx:] = cp.linspace(cp.pi/4, cp.pi/2.5,                # 45-72 degrees
+                                        n_freqs-mid_freq_idx)
             
         # Convert phase shifts to complex exponentials for FFT multiplication
         self.decorrelation_phases = cp.exp(1j * phases)
@@ -794,9 +780,6 @@ class NoiseGenerator:
     
     def _apply_haas_effect(self, noise_block, block_size):
         """Apply subtle Haas effect for enhanced stereo width"""
-        if not self.config.haas_effect:
-            return noise_block
-        
         # Create a subtle delay (5-15ms) for one channel
         # Note: Keeping delay in ms the same (8ms) despite sample rate change
         delay_samples = int(0.008 * self.config.sample_rate)  # 8ms delay (384 samples at 48kHz)
@@ -837,9 +820,6 @@ class NoiseGenerator:
         2. Applies modulation in the frequency domain for smoother results
         3. Uses proper phase offsets to create realistic spatial movement
         """
-        if not self.config.natural_modulation:
-            return noise_block
-        
         # Generate time indices for this block with proper time offset
         t_start = block_start_idx / self.config.sample_rate
         t = cp.linspace(t_start, t_start + block_size/self.config.sample_rate, block_size, endpoint=False)
@@ -955,70 +935,6 @@ class NoiseGenerator:
         
         return noise_block
     
-    def _apply_natural_modulation_simple(self, noise_block, block_start_idx, block_size):
-        """Add subtle multi-band modulation for more organic sound (simplified version)
-        
-        This implementation applies independent time-domain modulation for
-        different frequency bands to create a more natural sound.
-        """
-        if not self.config.natural_modulation:
-            return noise_block
-            
-        # Generate time indices for this block
-        t_start = block_start_idx / self.config.sample_rate
-        t = cp.linspace(t_start, t_start + block_size/self.config.sample_rate, block_size, endpoint=False)
-        
-        # Process each channel independently
-        for ch in range(2):
-            # Use different phase offset for each channel
-            phase_offset = 0 if ch == 0 else cp.pi / 3
-            
-            # Get channel data
-            signal = noise_block[ch, :block_size]
-            
-            # Convert to frequency domain
-            signal_fft = cufft.rfft(signal)
-            n_bins = len(signal_fft)
-            
-            # Calculate frequency band boundaries
-            freq_resolution = self.config.sample_rate / block_size
-            low_band_idx = int(300 / freq_resolution)  # 0-300 Hz
-            mid_band_idx = int(1800 / freq_resolution)  # 300-1800 Hz
-            
-            # Ensure valid indices
-            low_band_idx = max(1, min(low_band_idx, n_bins - 1))
-            mid_band_idx = max(low_band_idx + 1, min(mid_band_idx, n_bins - 1))
-            
-            # Create separate spectral bands
-            low_band_fft = cp.zeros_like(signal_fft)
-            low_band_fft[:low_band_idx] = signal_fft[:low_band_idx]
-            
-            mid_band_fft = cp.zeros_like(signal_fft)
-            mid_band_fft[low_band_idx:mid_band_idx] = signal_fft[low_band_idx:mid_band_idx]
-            
-            high_band_fft = cp.zeros_like(signal_fft)
-            high_band_fft[mid_band_idx:] = signal_fft[mid_band_idx:]
-            
-            # Convert bands back to time domain
-            low_band = cufft.irfft(low_band_fft, n=block_size)
-            mid_band = cufft.irfft(mid_band_fft, n=block_size)
-            high_band = cufft.irfft(high_band_fft, n=block_size)
-            
-            # Create modulation functions with different rates for each band
-            mod_low = 1.0 + 0.04 * cp.sin(2 * cp.pi * 0.05 * t + phase_offset)
-            mod_mid = 1.0 + 0.03 * cp.sin(2 * cp.pi * 0.11 * t + phase_offset + 0.7)
-            mod_high = 1.0 + 0.02 * cp.sin(2 * cp.pi * 0.17 * t + phase_offset + 1.3)
-            
-            # Apply modulation to each band
-            low_band *= mod_low
-            mid_band *= mod_mid
-            high_band *= mod_high
-            
-            # Recombine bands
-            noise_block[ch, :block_size] = low_band + mid_band + high_band
-        
-        return noise_block
-    
     def _generate_noise_colors(self, block_size):
         """Generate only the noise colors needed based on color mix
         
@@ -1124,21 +1040,17 @@ class NoiseGenerator:
                 block_size
             )
             
-            # Apply stereo decorrelation
+            # Apply enhanced stereo processing (always enabled for best quality)
+            # 1. Apply stereo decorrelation for natural stereo field
             mixed_noise = self._apply_stereo_decorrelation(mixed_noise, block_size)
             
-            # Apply Haas effect for enhanced stereo imaging if enabled
-            if self.config.haas_effect:
-                mixed_noise = self._apply_haas_effect(mixed_noise, block_size)
+            # 2. Apply Haas effect for enhanced stereo width
+            mixed_noise = self._apply_haas_effect(mixed_noise, block_size)
                 
-            # Apply natural modulation for more organic sound if enabled
-            if self.config.natural_modulation:
-                # Use the full implementation for best quality
-                mixed_noise = self._apply_natural_modulation(mixed_noise, block_start_idx, block_size)
-                # Alternative: use simpler implementation for better performance
-                # mixed_noise = self._apply_natural_modulation_simple(mixed_noise, block_start_idx, block_size)
+            # 3. Apply natural modulation for more organic sound
+            mixed_noise = self._apply_natural_modulation(mixed_noise, block_start_idx, block_size)
             
-            # Apply LFO modulation if enabled
+            # Apply LFO modulation if enabled (still optional)
             mixed_noise = self._apply_lfo_modulation(mixed_noise, block_start_idx, block_size)
             
             # Apply multi-stage gain and limiting
@@ -1646,9 +1558,9 @@ def load_preset(preset_name):
 def main():
     """Main entry point for the headless Noise Generator"""
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Noise Generator v2.0.4 - Enhanced DSP for YouTube (Headless)")
+    parser = argparse.ArgumentParser(description="Noise Generator v2.0.5 - Simplified DSP for YouTube (Headless)")
     
-    # Key parameters - removed channels parameter, now always stereo
+    # Key parameters - stereo always enabled
     parser.add_argument("--output", type=str, help="Output file path (WAV or FLAC)", default="noise_output.wav")
     parser.add_argument("--duration", type=int, help="Duration in seconds", default=600)
     
@@ -1664,17 +1576,6 @@ def main():
     parser.add_argument("--preset", type=str, help="Load a preset configuration", default=None)
     parser.add_argument("--rms", type=float, help="Target RMS level in dBFS", default=None)
     parser.add_argument("--peak", type=float, help="True-peak ceiling (dBFS)", default=None)
-    
-    # Enhanced audio quality options - stereo-specific options kept
-    parser.add_argument("--natural-mod", action="store_true", help="Enable natural modulation for more organic sound")
-    parser.add_argument("--no-natural-mod", action="store_false", dest="natural_mod", help="Disable natural modulation")
-    parser.add_argument("--haas", action="store_true", help="Enable Haas effect for enhanced stereo width")
-    parser.add_argument("--no-haas", action="store_false", dest="haas", help="Disable Haas effect")
-    parser.add_argument("--enhanced-stereo", action="store_true", help="Enable enhanced stereo decorrelation")
-    parser.add_argument("--no-enhanced-stereo", action="store_false", dest="enhanced_stereo", help="Use basic stereo decorrelation")
-    
-    # Set defaults for enhanced options
-    parser.set_defaults(natural_mod=True, haas=True, enhanced_stereo=True)
     
     # Output options
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
@@ -1729,16 +1630,13 @@ def main():
         color_mix = preset_config["color_mix"]
         logger.info(f"Using preset color mix: {color_mix}")
     
-    # Create configuration with enhanced stereo options
+    # Create simplified configuration (no more enhanced stereo toggles)
     config = NoiseConfig(
         seed=seed,
         duration=args.duration,
         color_mix=color_mix,
         warmth=args.warmth if color_mix is None else None,
-        lfo_rate=args.lfo if args.lfo is not None else preset_config.get("lfo_rate"),
-        natural_modulation=args.natural_mod,
-        haas_effect=args.haas,
-        enhanced_stereo=args.enhanced_stereo
+        lfo_rate=args.lfo if args.lfo is not None else preset_config.get("lfo_rate")
     )
     
     # Override with explicit RMS if provided
@@ -1760,10 +1658,11 @@ def main():
         logger.info(f"Color mix: white={color_mix['white']:.2f}, pink={color_mix['pink']:.2f}, brown={color_mix['brown']:.2f}")
     logger.info(f"Seed: {seed}")
     
-    # Log stereo enhancement options
-    logger.info(f"Enhanced stereo: {'ON' if args.enhanced_stereo else 'OFF'}")
-    logger.info(f"Haas effect: {'ON' if args.haas else 'OFF'}")
-    logger.info(f"Natural modulation: {'ON' if args.natural_mod else 'OFF'}")
+    # Log integrated DSP features
+    logger.info("Using integrated high-quality DSP features:")
+    logger.info("- Enhanced stereo decorrelation for natural stereo field")
+    logger.info("- Haas effect for enhanced width with bass protection")
+    logger.info("- Natural modulation for organic sound character")
     
     # Check for pyloudnorm availability for accurate LUFS measurement
     try:

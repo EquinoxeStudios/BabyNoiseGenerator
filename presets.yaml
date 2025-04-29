@@ -1,4 +1,4 @@
-# Baby-Noise Generator v2.0.2 Enhanced DSP Edition - Presets
+# Baby-Noise Generator v2.0.5 Simplified DSP Edition - Presets
 # Stereo-optimized presets for YouTube content
 
 presets:
@@ -6,82 +6,52 @@ presets:
     color_mix: {white: 0.4, pink: 0.4, brown: 0.2}
     rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
     
   # Pure color presets
   white_only:
     color_mix: {white: 1.0, pink: 0.0, brown: 0.0}
     rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
-    natural_modulation: false  # Disable for pure spectral characteristic
-    haas_effect: true
-    enhanced_stereo: true
     
   pink_only:
     color_mix: {white: 0.0, pink: 1.0, brown: 0.0}
     rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
-    natural_modulation: false  # Disable for pure spectral characteristic
-    haas_effect: true
-    enhanced_stereo: true
     
   brown_only:
     color_mix: {white: 0.0, pink: 0.0, brown: 1.0}
     rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
-    natural_modulation: false  # Disable for pure spectral characteristic
-    haas_effect: true
-    enhanced_stereo: true
     
   # YouTube optimized preset
   youtube:
     color_mix: {white: 0.4, pink: 0.4, brown: 0.2}
     rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
     
-  # Special presets for enhanced features
+  # Enhanced presets with different color mixes
   enhanced_organic:
     color_mix: {white: 0.3, pink: 0.5, brown: 0.2}
     rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
-    natural_modulation: true   # Enable organic modulation
-    haas_effect: true          # Enable Haas effect
-    enhanced_stereo: true      # Enable enhanced stereo
   
   enhanced_spatial:
     color_mix: {white: 0.2, pink: 0.5, brown: 0.3}
     rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.08     # Hz
-    natural_modulation: true   # Enable organic modulation
-    haas_effect: true          # Enable Haas effect
-    enhanced_stereo: true      # Enable enhanced stereo
   
   enhanced_warm:
     color_mix: {white: 0.1, pink: 0.4, brown: 0.5}
     rms_target: -20.0  # YouTube standard level
     lfo_rate: 0.06     # Hz
-    natural_modulation: true   # Enable organic modulation
-    haas_effect: true          # Enable Haas effect
-    enhanced_stereo: true      # Enable enhanced stereo
 
-  # YouTube-optimized stereo enhancement presets
+  # YouTube-optimized presets
   youtube_cinematic:
     color_mix: {white: 0.1, pink: 0.3, brown: 0.6}
     rms_target: -18.0  # Slightly louder for YouTube
     lfo_rate: 0.07     # Subtle modulation
-    natural_modulation: true
-    haas_effect: true   
-    enhanced_stereo: true
     
   youtube_widescape:
     color_mix: {white: 0.2, pink: 0.5, brown: 0.3}
     rms_target: -19.0  # YouTube standard level
     lfo_rate: 0.1      # Hz
-    natural_modulation: true
-    haas_effect: true
-    enhanced_stereo: true
