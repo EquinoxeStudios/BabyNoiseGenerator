@@ -28,7 +28,8 @@ except ImportError:
 # Constants
 SAMPLE_RATE = 44100
 FFT_BLOCK_SIZE = 2**18       # ~1.5 seconds at 44.1 kHz (large block optimization)
-BLOCK_OVERLAP = 4096         # For smooth transitions between blocks
+BLOCK_OVERLAP = 8192         # For smooth transitions between blocks (increased for better blending)
+LOOP_CROSSFADE = 2**15       # Specific crossfade size for loop points (32768 samples ≈ 0.75s)
 APP_TITLE = "Baby-Noise Generator v2.0.5 - Optimized DSP (Headless)"
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/BabyNoise")
 MIN_DURATION = 1             # Minimum allowed duration in seconds
@@ -972,7 +973,7 @@ class NoiseGenerator:
         # Otherwise keep current size
         return current_size
     
-    def generate_to_file(self, output_path, progress_callback=None):
+    def generate_to_file(self, output_path, progress_callback=None, make_loop=True):
         """Generate noise and save to file with progress tracking"""
         import soundfile as sf
         
@@ -1112,6 +1113,195 @@ class NoiseGenerator:
                         # Release unused memory back to the pool
                         self.mem_pool.free_all_blocks()
                         self.pinned_pool.free_all_blocks()
+                        
+            # Apply seamless looping as a separate post-processing step if requested
+            if make_loop and self.config.duration >= 5.0:  # Only for files longer than 5 seconds
+                # Calculate appropriate crossfade duration based on file length
+                # Use 2-5% of total duration with limits
+                crossfade_duration = min(2.0, max(0.5, self.config.duration * 0.03))
+                
+                # Import the necessary modules for post-processing
+                import numpy as np
+                from scipy import signal
+                
+                # Create the seamless loop
+                logger.info(f"Applying seamless loop with {crossfade_duration:.2f}s crossfade...")
+                
+                # Define the post-processing function for creating loops
+                def create_seamless_loop(file_path, crossfade_duration=1.0):
+                    """Create a seamless loop by crossfading the beginning and end of an audio file."""
+                    import tempfile
+                    import os
+                    
+                    try:
+                        # Get file info
+                        info = sf.info(file_path)
+                        sample_rate = info.samplerate
+                        channels = info.channels
+                        total_frames = info.frames
+                        
+                        # Calculate crossfade samples (ensure it's even for better FFT)
+                        crossfade_samples = int(crossfade_duration * sample_rate)
+                        if crossfade_samples % 2 == 1:
+                            crossfade_samples += 1
+                            
+                        # Check if file is long enough for crossfade
+                        if total_frames <= crossfade_samples * 2:
+                            logger.warning(f"File too short for {crossfade_duration}s crossfade, skipping loop creation")
+                            return False
+                            
+                        # Load the entire file
+                        data, sr = sf.read(file_path)
+                        
+                        # Extract beginning and end sections
+                        beginning = data[:crossfade_samples].copy()
+                        ending = data[-crossfade_samples:].copy()
+                        
+                        # Create temporary file for processing
+                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                            temp_path = temp_file.name
+                        
+                        # Perform phase alignment between beginning and end
+                        # For each channel if stereo
+                        if channels > 1:
+                            # Process each channel
+                            for ch in range(channels):
+                                # Find correlation between beginning and ending
+                                corr = signal.correlate(ending[:, ch], beginning[:, ch], mode='same')
+                                lag = np.argmax(corr) - (len(corr) // 2)
+                                
+                                # Adjust lag to be within reasonable bounds
+                                if abs(lag) > crossfade_samples // 4:
+                                    lag = 0  # If alignment seems poor, don't shift
+                                
+                                # Apply shift based on correlation
+                                if lag > 0:
+                                    # Shift ending forward
+                                    ending[lag:, ch] = ending[:-lag, ch]
+                                elif lag < 0:
+                                    # Shift beginning forward
+                                    beginning[-lag:, ch] = beginning[:lag, ch]
+                        else:
+                            # Same process for mono
+                            corr = signal.correlate(ending, beginning, mode='same')
+                            lag = np.argmax(corr) - (len(corr) // 2)
+                            if abs(lag) <= crossfade_samples // 4:
+                                if lag > 0:
+                                    ending[lag:] = ending[:-lag]
+                                elif lag < 0:
+                                    beginning[-lag:] = beginning[:lag]
+                        
+                        # Create equal power crossfade windows (sine-squared and cosine-squared)
+                        t = np.linspace(0, np.pi/2, crossfade_samples)
+                        fade_in = np.sin(t) ** 2
+                        fade_out = np.cos(t) ** 2
+                        
+                        # Apply crossfade
+                        if channels > 1:
+                            # Reshape for broadcasting with multichannel audio
+                            fade_in = fade_in.reshape(-1, 1)
+                            fade_out = fade_out.reshape(-1, 1)
+                        
+                        # Create crossfaded section
+                        crossfaded = beginning * fade_in + ending * fade_out
+                        
+                        # Create final looped audio: everything except the last crossfade_samples, 
+                        # then append the crossfaded section
+                        final_data = np.concatenate([data[:-crossfade_samples], crossfaded])
+                        
+                        # Write to temporary file first (to ensure it's valid)
+                        sf.write(temp_path, final_data, sr)
+                        
+                        # If successful, replace original file
+                        os.replace(temp_path, file_path)
+                        
+                        logger.info(f"Created seamless loop with {crossfade_duration}s crossfade and phase alignment")
+                        return True
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to create seamless loop: {str(e)}")
+                        # Clean up temp file if it exists
+                        if 'temp_path' in locals() and os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except:
+                                pass
+                        return False
+                
+                # Apply the seamless loop
+                create_seamless_loop(output_path, crossfade_duration)
+        
+        except Exception as e:
+            logger.error(f"Error during file generation: {str(e)}")
+            return {
+                "error": f"Failed to generate file: {str(e)}",
+                "success": False
+            }
+            
+        # Calculate processing metrics
+        end_time = time.time()
+        processing_time = end_time - start_time
+        
+        # Measure output file statistics
+        result = {
+            "processing_time": processing_time,
+            "samples_generated": samples_written,
+            "real_time_factor": self.config.duration / processing_time,
+            "success": True
+        }
+        
+        logger.info(f"Generated {self.config.duration:.1f}s of stereo noise in {processing_time:.1f}s "
+                    f"(speed: {result['real_time_factor']:.1f}x real-time)")
+        
+        # Measure true peak and RMS on disk to verify
+        try:
+            audio_data, sample_rate = sf.read(output_path)
+            
+            # Calculate metrics on both channels
+            peak_left = np.max(np.abs(audio_data[:, 0]))
+            peak_right = np.max(np.abs(audio_data[:, 1]))
+            peak_db = 20 * np.log10(max(peak_left, peak_right) + 1e-10)
+            
+            # Calculate RMS
+            rms_left = np.sqrt(np.mean(audio_data[:, 0]**2))
+            rms_right = np.sqrt(np.mean(audio_data[:, 1]**2))
+            rms_db = 20 * np.log10((rms_left + rms_right) / 2 + 1e-10)
+            
+            # Accurate LUFS measurement using pyloudnorm if available
+            try:
+                import pyloudnorm as pyln
+                
+                # Create BS.1770-4 meter
+                meter = pyln.Meter(sample_rate)  # defaults to BS.1770-4
+                
+                # Measure integrated loudness (stereo)
+                lufs = meter.integrated_loudness(audio_data)
+                
+                logger.info(f"Measured accurate LUFS using pyloudnorm (BS.1770-4)")
+            except ImportError:
+                # Fall back to approximate LUFS calculation
+                lufs = rms_db + 3.0  # Simple approximation
+                logger.info(f"Using approximate LUFS calculation (pyloudnorm not installed)")
+            
+            # Store measurements in results
+            result["peak_db"] = peak_db
+            result["rms_db"] = rms_db
+            result["integrated_lufs"] = lufs
+            
+            logger.info(f"Output file metrics: {peak_db:.1f} dBFS peak, {lufs:.1f} LUFS")
+            
+            # Log if looping was applied
+            if make_loop and self.config.duration >= 5.0:
+                result["looped"] = True
+                logger.info("File has been processed for seamless looping")
+            else:
+                result["looped"] = False
+                
+        except Exception as e:
+            logger.error(f"Error measuring output file: {e}")
+            result["warning"] = f"Generated successfully, but encountered an error measuring the output: {str(e)}"
+        
+        return result
         
         except Exception as e:
             logger.error(f"Error during file generation: {str(e)}")
@@ -1266,9 +1456,13 @@ def main():
     parser.add_argument("--natural-mod", action="store_true", help="Enable natural modulation for more organic sound")
     parser.add_argument("--no-natural-mod", action="store_false", dest="natural_mod", help="Disable natural modulation")
     parser.add_argument("--haas", action="store_true", help="Enable Haas effect for enhanced stereo width")
-    parser.add_argument("--no-haas", action="store_false", dest="haas", help="Disable Haas effect")
+    parser.add_argument("--no-haas", action="store_false", dest="haas", help="Disable Haas effect") 
     parser.add_argument("--enhanced-stereo", action="store_true", help="Enable enhanced stereo decorrelation")
     parser.add_argument("--no-enhanced-stereo", action="store_false", dest="enhanced_stereo", help="Use basic stereo decorrelation")
+    
+    # Looping options
+    parser.add_argument("--loop", action="store_true", help="Create seamless looping file (optimized for YouTube)", default=True)
+    parser.add_argument("--no-loop", action="store_false", dest="loop", help="Don't create special loop crossfade")
     
     # Set defaults for enhanced options
     parser.set_defaults(natural_mod=True, haas=True, enhanced_stereo=True)
@@ -1354,6 +1548,7 @@ def main():
     logger.info(f"Enhanced stereo: {'ON' if args.enhanced_stereo else 'OFF'}")
     logger.info(f"Haas effect: {'ON' if args.haas else 'OFF'}")
     logger.info(f"Natural modulation: {'ON' if args.natural_mod else 'OFF'}")
+    logger.info(f"Seamless looping: {'ON' if args.loop else 'OFF'}")
     
     # Check for pyloudnorm availability for accurate LUFS measurement
     try:
@@ -1368,7 +1563,7 @@ def main():
     
     # Generate to file with progress tracking in console
     try:
-        result = generator.generate_to_file(args.output, print_progress)
+        result = generator.generate_to_file(args.output, print_progress, make_loop=args.loop)
         
         # Check if generation was successful
         if not result.get("success", False):
