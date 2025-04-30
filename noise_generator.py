@@ -856,7 +856,10 @@ class NoiseGenerator:
         return noise_block
 
     def _apply_micro_pitch_variations(self, noise_block, block_start_idx, block_size):
-        """Apply subtle micro-pitch variations for added naturalness"""
+        """
+        Apply subtle micro-pitch variations for added naturalness - OPTIMIZED VERSION
+        This vectorized implementation replaces the slow Python loops with efficient array operations
+        """
         # Only apply if natural modulation is enabled
         if not self.config.natural_modulation:
             return noise_block
@@ -869,6 +872,12 @@ class NoiseGenerator:
         low_pitch_mod = 0.005 * cp.sin(2 * cp.pi * 0.011 * t_start)           # ±0.5% variation
         mid_pitch_mod = 0.003 * cp.sin(2 * cp.pi * 0.019 * t_start + 0.7)     # ±0.3% variation
         high_pitch_mod = 0.002 * cp.sin(2 * cp.pi * 0.031 * t_start + 1.4)    # ±0.2% variation
+        
+        # Skip processing if modulation values are negligible (optimization)
+        if (abs(low_pitch_mod) < 0.0005 and 
+            abs(mid_pitch_mod) < 0.0005 and 
+            abs(high_pitch_mod) < 0.0005):
+            return noise_block
         
         # Process each channel
         for ch in range(2):
@@ -884,39 +893,66 @@ class NoiseGenerator:
             # Create arrays to hold the resampled spectrum
             resampled_fft = cp.zeros_like(channel_fft, dtype=cp.complex128)
             
-            # Process each frequency band separately with different pitch variations
-            # For low frequencies: apply low_pitch_mod
-            # For this implementation, we'll use a simplified approach using bin shifting
+            # VECTORIZED IMPLEMENTATION - Replace the three slow Python loops
             
+            # Create arrays of bin indices for each band
+            low_bins = cp.arange(1, low_idx)
+            mid_bins = cp.arange(low_idx, mid_idx)
+            high_bins = cp.arange(mid_idx, n_bins)
+            
+            # Calculate bin shifts for each band at once
             # Low frequencies
-            for i in range(1, low_idx):  # Skip DC (bin 0)
-                # Calculate fractional bin shift
-                bin_shift = i * low_pitch_mod  # Proportional to frequency
-                bin_int = int(i + bin_shift)
-                bin_frac = (i + bin_shift) - bin_int
+            if len(low_bins) > 0:
+                low_bin_shifts = low_bins * low_pitch_mod
+                low_bin_ints = cp.floor(low_bins + low_bin_shifts).astype(cp.int32)
+                low_bin_fracs = (low_bins + low_bin_shifts) - low_bin_ints
                 
-                # Ensure we stay within valid bin range
-                if 0 <= bin_int < n_bins-1:
-                    # Linear interpolation between bins for fractional shifts
-                    resampled_fft[i] = channel_fft[bin_int] * (1 - bin_frac) + channel_fft[bin_int+1] * bin_frac
-                    
+                # Filter out bins that would go out of range
+                valid_mask = (low_bin_ints >= 0) & (low_bin_ints < n_bins-1)
+                valid_bins = low_bins[valid_mask]
+                valid_ints = low_bin_ints[valid_mask]
+                valid_fracs = low_bin_fracs[valid_mask]
+                
+                # Apply the interpolation in vectorized form
+                if len(valid_bins) > 0:
+                    resampled_fft[valid_bins] = (
+                        channel_fft[valid_ints] * (1 - valid_fracs) + 
+                        channel_fft[valid_ints + 1] * valid_fracs
+                    )
+                
             # Mid frequencies
-            for i in range(low_idx, mid_idx):
-                bin_shift = i * mid_pitch_mod
-                bin_int = int(i + bin_shift)
-                bin_frac = (i + bin_shift) - bin_int
+            if len(mid_bins) > 0:
+                mid_bin_shifts = mid_bins * mid_pitch_mod
+                mid_bin_ints = cp.floor(mid_bins + mid_bin_shifts).astype(cp.int32)
+                mid_bin_fracs = (mid_bins + mid_bin_shifts) - mid_bin_ints
                 
-                if 0 <= bin_int < n_bins-1:
-                    resampled_fft[i] = channel_fft[bin_int] * (1 - bin_frac) + channel_fft[bin_int+1] * bin_frac
-                    
+                valid_mask = (mid_bin_ints >= 0) & (mid_bin_ints < n_bins-1)
+                valid_bins = mid_bins[valid_mask]
+                valid_ints = mid_bin_ints[valid_mask]
+                valid_fracs = mid_bin_fracs[valid_mask]
+                
+                if len(valid_bins) > 0:
+                    resampled_fft[valid_bins] = (
+                        channel_fft[valid_ints] * (1 - valid_fracs) + 
+                        channel_fft[valid_ints + 1] * valid_fracs
+                    )
+                
             # High frequencies
-            for i in range(mid_idx, n_bins):
-                bin_shift = i * high_pitch_mod
-                bin_int = int(i + bin_shift)
-                bin_frac = (i + bin_shift) - bin_int
+            if len(high_bins) > 0:
+                high_bin_shifts = high_bins * high_pitch_mod
+                high_bin_ints = cp.floor(high_bins + high_bin_shifts).astype(cp.int32)
+                high_bin_fracs = (high_bins + high_bin_shifts) - high_bin_ints
                 
-                if 0 <= bin_int < n_bins-1:
-                    resampled_fft[i] = channel_fft[bin_int] * (1 - bin_frac) + channel_fft[bin_int+1] * bin_frac
+                valid_mask = (high_bin_ints >= 0) & (high_bin_ints < n_bins-1)
+                valid_bins = high_bins[valid_mask]
+                valid_ints = high_bin_ints[valid_mask]
+                valid_fracs = high_bin_fracs[valid_mask]
+                
+                if len(valid_bins) > 0:
+                    resampled_fft[valid_bins] = (
+                        channel_fft[valid_ints] * (1 - valid_fracs) + 
+                        channel_fft[valid_ints + 1] * valid_fracs
+                    )
             
             # Preserve DC component
             resampled_fft[0] = channel_fft[0]
