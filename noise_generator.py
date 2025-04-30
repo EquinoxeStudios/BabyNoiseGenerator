@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# Baby-Noise Generator App v2.0.5 - Optimized DSP Edition
+# Baby-Noise Generator App v2.0.6 - Enhanced Organic DSP Edition
 # Optimized for sound quality and performance with advanced DSP techniques
 # Exclusively optimized for GPU acceleration with spectral processing
-# Stereo-only version for YouTube publishing
+# Stereo-only version for YouTube publishing with enhanced organic sound
 
 import os
 import sys
@@ -30,7 +30,7 @@ SAMPLE_RATE = 44100
 FFT_BLOCK_SIZE = 2**18       # ~1.5 seconds at 44.1 kHz (large block optimization)
 BLOCK_OVERLAP = 8192         # For smooth transitions between blocks (increased for better blending)
 LOOP_CROSSFADE = 2**15       # Specific crossfade size for loop points (32768 samples ≈ 0.75s)
-APP_TITLE = "Baby-Noise Generator v2.0.5 - Optimized DSP (Headless)"
+APP_TITLE = "Baby-Noise Generator v2.0.6 - Enhanced Organic DSP (Headless)"
 DEFAULT_OUTPUT_DIR = os.path.expanduser("~/BabyNoise")
 MIN_DURATION = 1             # Minimum allowed duration in seconds
 MAX_MEMORY_LIMIT_FRACTION = 0.8  # Maximum fraction of GPU memory to use
@@ -594,29 +594,100 @@ class NoiseGenerator:
         
         return noise_block
     
+    # New enhanced functions for organic sound
+
+    def _create_complex_modulator(self, t, base_freq, complexity=3, depth=0.02):
+        """Create a complex modulation source from multiple sine waves
+        
+        Parameters:
+            t: Time array
+            base_freq: Base frequency in Hz
+            complexity: Number of summed sine waves
+            depth: Overall modulation depth
+            
+        Returns complex modulation signal with values centered around 1.0
+        """
+        # Start with a baseline of 1.0
+        modulator = cp.ones_like(t, dtype=self.precision)
+        
+        # Use prime-number-based frequency ratios for non-repeating patterns
+        prime_ratios = [1.0, 1.7, 2.3, 3.1, 3.7, 4.1]
+        
+        # Scale the depth based on complexity (more components = lower individual amplitude)
+        component_depth = depth / cp.sqrt(complexity)
+        
+        # Sum multiple sine waves with different frequencies, phases and amplitudes
+        for i in range(complexity):
+            # Generate frequency with slight tuning variations for each component
+            # Use prime number ratios to avoid simple harmonic patterns
+            freq = base_freq * prime_ratios[i % len(prime_ratios)]
+            
+            # Randomize phase for each component based on seed
+            phase_offset = cp.pi * 2 * (((self.config.seed + i * 1000) % 10000) / 10000.0)
+            
+            # Generate component, decreasing amplitude for higher components
+            amplitude = component_depth / (1.0 + i * 0.5)
+            component = amplitude * cp.sin(2 * cp.pi * freq * t + phase_offset)
+            
+            # Add to the modulator
+            modulator += component
+        
+        return modulator
+
+    def _create_filtered_noise_lfo(self, t, cutoff_freq=0.2, depth=0.02, seed_offset=0):
+        """Create a filtered noise LFO for organic modulation
+        
+        Parameters:
+            t: Time array
+            cutoff_freq: LPF cutoff frequency in Hz
+            depth: Modulation depth
+            seed_offset: Offset to add to seed for different generators
+            
+        Returns: Slowly varying filtered noise centered around 1.0
+        """
+        # Create a separate random generator with a derived seed
+        lfo_rng = cp.random.RandomState(seed=self.config.seed + seed_offset)
+        
+        # Generate white noise slightly longer than needed
+        # (for filter startup transients)
+        padding = int(self.config.sample_rate / cutoff_freq)
+        noise_len = len(t) + padding
+        noise = lfo_rng.normal(0, 1, noise_len).astype(self.precision)
+        
+        # Design a low-pass filter for very slow modulations
+        nyquist = self.config.sample_rate / 2
+        normalized_cutoff = cutoff_freq / nyquist
+        
+        # Use Butterworth filter design
+        b, a = cusignal.butter(2, normalized_cutoff, 'low')
+        
+        # Apply the filter to get a slowly varying signal
+        filtered = cusignal.lfilter(b, a, noise)[padding:]  # Skip padding/transient
+        
+        # Normalize and scale the filtered noise
+        filtered = filtered / (cp.std(filtered) * 3 + 1e-10)  # Normalize to roughly ±0.33 range
+        
+        # Center around 1.0 with specified depth
+        return 1.0 + filtered * depth
+    
     def _apply_natural_modulation(self, noise_block, block_start_idx, block_size):
         """Add subtle multi-band modulation for more organic sound"""
         if not self.config.natural_modulation:
             return noise_block
-            
-        # Create different modulation rates for different frequency bands
-        block_time = block_size / self.config.sample_rate
-        
-        # Generate time indices for this block
+                
+        # Create time indices for this block
         t_start = block_start_idx / self.config.sample_rate
-        t = cp.linspace(t_start, t_start + block_time, block_size, endpoint=False)
+        t = cp.linspace(t_start, t_start + block_size/self.config.sample_rate, block_size, endpoint=False)
         
-        # Different modulation rates for different frequency bands
-        # These subtle modulations create a more natural, less static sound
+        # Create complex modulation sources
+        # Slow modulation for lows (0.05-0.07 Hz)
+        low_mod = self._create_filtered_noise_lfo(t, cutoff_freq=0.05, depth=0.03, seed_offset=1)
         
-        # Slow modulation for lows (0.07 Hz)
-        low_mod = 1.0 + 0.02 * cp.sin(2 * cp.pi * 0.07 * t)
+        # Medium modulation for mids (0.1-0.2 Hz) 
+        mid_mod = self._create_complex_modulator(t, base_freq=0.13, complexity=3, depth=0.025)
         
-        # Medium modulation for mids (0.13 Hz)
-        mid_mod = 1.0 + 0.015 * cp.sin(2 * cp.pi * 0.13 * t)
-        
-        # Faster modulation for highs (0.27 Hz)
-        high_mod = 1.0 + 0.01 * cp.sin(2 * cp.pi * 0.27 * t)
+        # Faster but subtle modulation for highs (0.2-0.3 Hz)
+        high_mod = self._create_complex_modulator(t, base_freq=0.27, complexity=4, depth=0.02)
         
         # Process left channel with spectral modulation
         left_fft = cufft.rfft(noise_block[0, :block_size])
@@ -627,16 +698,43 @@ class NoiseGenerator:
         low_idx = int(300 / freq_resolution)
         mid_idx = int(1500 / freq_resolution)
         
-        # Apply modulation to left channel
-        low_env = cp.linspace(1.0, 0.8, low_idx)
-        left_fft[:low_idx] = left_fft[:low_idx] * (1.0 + 0.03 * cp.sin(2 * cp.pi * 0.05 * t_start) * low_env)
+        # Create smooth transition envelopes between bands
+        # Create smooth envelopes with crossfades between bands
+        low_env = cp.ones(low_idx, dtype=self.precision)
+        low_transition = min(int(low_idx * 0.1), low_idx)  # 10% transition, with safety check
+        if low_transition > 0:
+            low_env[-low_transition:] = cp.linspace(1.0, 0.0, low_transition, dtype=self.precision)
         
-        mid_env = cp.concatenate([cp.linspace(0.8, 1.0, min(10, low_idx)), 
-                                cp.ones(mid_idx - low_idx - min(10, low_idx))])
-        left_fft[low_idx:mid_idx] = left_fft[low_idx:mid_idx] * (1.0 + 0.02 * cp.sin(2 * cp.pi * 0.13 * t_start) * mid_env)
+        mid_env = cp.zeros(mid_idx - low_idx, dtype=self.precision)
+        mid_transition_low = min(int((mid_idx - low_idx) * 0.1), mid_idx - low_idx)
+        mid_transition_high = min(int((mid_idx - low_idx) * 0.1), mid_idx - low_idx - mid_transition_low)
         
-        high_env = cp.ones(n_bins - mid_idx)
-        left_fft[mid_idx:] = left_fft[mid_idx:] * (1.0 + 0.01 * cp.sin(2 * cp.pi * 0.21 * t_start) * high_env)
+        if mid_transition_low > 0:
+            mid_env[:mid_transition_low] = cp.linspace(0.0, 1.0, mid_transition_low, dtype=self.precision)
+        if mid_transition_high > 0:
+            mid_env[-(mid_transition_high):] = cp.linspace(1.0, 0.0, mid_transition_high, dtype=self.precision)
+        # Fill the middle part with ones
+        if mid_transition_low < len(mid_env) - mid_transition_high:
+            mid_env[mid_transition_low:len(mid_env)-mid_transition_high] = 1.0
+        
+        high_env = cp.zeros(n_bins - mid_idx, dtype=self.precision)
+        high_transition = min(int((n_bins - mid_idx) * 0.1), n_bins - mid_idx)
+        if high_transition > 0:
+            high_env[:high_transition] = cp.linspace(0.0, 1.0, high_transition, dtype=self.precision)
+        high_env[high_transition:] = 1.0
+        
+        # Apply modulation to left channel frequency bands with complex modulators
+        # Low frequencies: use filtered noise LFO for organic variation
+        mod_factor_low = low_mod[0] - 1.0  # Extract modulation factor (centered at 0)
+        left_fft[:low_idx] = left_fft[:low_idx] * (1.0 + mod_factor_low * low_env)
+        
+        # Mid frequencies: use complex sine modulator
+        mod_factor_mid = mid_mod[0] - 1.0
+        left_fft[low_idx:mid_idx] = left_fft[low_idx:mid_idx] * (1.0 + mod_factor_mid * mid_env)
+        
+        # High frequencies: use more complex modulator with higher component count
+        mod_factor_high = high_mod[0] - 1.0
+        left_fft[mid_idx:] = left_fft[mid_idx:] * (1.0 + mod_factor_high * high_env)
         
         # Convert back to time domain
         noise_block[0, :block_size] = cufft.irfft(left_fft, n=block_size)
@@ -644,16 +742,240 @@ class NoiseGenerator:
         # Process right channel with phase offset for enhanced decorrelation
         right_fft = cufft.rfft(noise_block[1, :block_size])
         
-        # Apply modulation to right channel with phase offset
-        phase_offset = cp.pi / 4  # 45 degree offset
-        right_fft[:low_idx] = right_fft[:low_idx] * (1.0 + 0.03 * cp.sin(2 * cp.pi * 0.05 * t_start + phase_offset) * low_env)
-        right_fft[low_idx:mid_idx] = right_fft[low_idx:mid_idx] * (1.0 + 0.02 * cp.sin(2 * cp.pi * 0.13 * t_start + phase_offset) * mid_env)
-        right_fft[mid_idx:] = right_fft[mid_idx:] * (1.0 + 0.01 * cp.sin(2 * cp.pi * 0.21 * t_start + phase_offset) * high_env)
+        # Apply modulation to right channel with phase offset for enhanced stereo effect
+        # Dynamically modulate the phase offset itself for added organic quality
+        phase_offset = cp.pi / 4  # 45 degree base offset
+        phase_variation = cp.pi / 12  # ±15 degree variation
+        current_phase = phase_offset + phase_variation * cp.sin(2 * cp.pi * 0.037 * t_start)
+        
+        # Apply the same modulators but with phase offset to right channel
+        right_fft[:low_idx] = right_fft[:low_idx] * (1.0 + mod_factor_low * cp.cos(current_phase) * low_env)
+        right_fft[low_idx:mid_idx] = right_fft[low_idx:mid_idx] * (1.0 + mod_factor_mid * cp.cos(current_phase + cp.pi/6) * mid_env)
+        right_fft[mid_idx:] = right_fft[mid_idx:] * (1.0 + mod_factor_high * cp.cos(current_phase + cp.pi/3) * high_env)
         
         # Convert back to time domain
         noise_block[1, :block_size] = cufft.irfft(right_fft, n=block_size)
         
         return noise_block
+
+    def _apply_dynamic_stereo_parameters(self, noise_block, block_start_idx, block_size):
+        """Apply dynamic, slowly evolving stereo parameters"""
+        
+        # Only apply if both stereo enhancement and natural modulation are enabled
+        if not (self.config.enhanced_stereo and self.config.natural_modulation):
+            return noise_block
+        
+        # Create slowly varying modulation for stereo parameters
+        t_start = block_start_idx / self.config.sample_rate
+        
+        # Generate modulator for decorrelation amount (very slow: 0.023 Hz)
+        decorr_mod = 1.0 + 0.15 * cp.sin(2 * cp.pi * 0.023 * t_start)
+        
+        # Generate modulator for Haas delay time (also very slow: 0.017 Hz)
+        # Add a different phase offset so it doesn't correlate with decorrelation modulation
+        delay_mod = 1.0 + 0.2 * cp.sin(2 * cp.pi * 0.017 * t_start + 0.5)
+        
+        # Apply dynamic decorrelation if enhanced stereo is enabled
+        if self.config.enhanced_stereo:
+            # Get the right channel and convert to frequency domain
+            right = noise_block[1, :block_size]
+            right_fft = cufft.rfft(right)
+            
+            # Create frequency-dependent phase shifts with time-varying strength
+            n_freqs = len(right_fft)
+            freq_resolution = self.config.sample_rate / block_size
+            
+            # Calculate frequency band boundaries
+            low_freq_idx = int(300 / freq_resolution)
+            mid_freq_idx = int(1500 / freq_resolution)
+            
+            # Create dynamic phases with modulated strength
+            phases = cp.zeros(n_freqs, dtype=self.precision)
+            
+            # Scale phase offsets by the decorrelation modulator
+            phases[:low_freq_idx] = cp.linspace(0, cp.pi/8, low_freq_idx) * decorr_mod
+            phases[low_freq_idx:mid_freq_idx] = cp.linspace(cp.pi/8, cp.pi/4, mid_freq_idx-low_freq_idx) * decorr_mod
+            phases[mid_freq_idx:] = cp.linspace(cp.pi/4, cp.pi/2.5, n_freqs-mid_freq_idx) * decorr_mod
+            
+            # Convert to complex exponentials for FFT multiplication
+            dynamic_decorr_phases = cp.exp(1j * phases)
+            
+            # Apply the dynamic phase shift
+            right_fft = right_fft * dynamic_decorr_phases
+            
+            # Convert back to time domain
+            noise_block[1, :block_size] = cufft.irfft(right_fft, n=block_size)
+        
+        # Apply dynamic Haas effect if enabled
+        if self.config.haas_effect:
+            # Base delay is 8ms
+            base_delay = 0.008  # seconds
+            delay_variation = 0.002  # ±2ms variation
+            
+            # Calculate current delay time with modulation
+            current_delay = base_delay + delay_variation * (delay_mod - 1.0)
+            
+            # Convert to samples
+            delay_samples = int(current_delay * self.config.sample_rate)
+            
+            # Get right channel for processing
+            right_orig = noise_block[1, :block_size]
+            
+            # Create delayed version of right channel
+            right_delayed = cp.zeros(block_size, dtype=self.precision)
+            right_delayed[delay_samples:] = right_orig[:block_size-delay_samples]
+            
+            # Convert both to frequency domain
+            right_fft = cufft.rfft(right_orig)
+            right_delayed_fft = cufft.rfft(right_delayed)
+            
+            # Apply frequency-dependent mixing of original and delayed signals
+            # Apply original in low frequencies, delayed in mid/high frequencies
+            n_freqs = len(right_fft)
+            cutoff_bin = int(150 / (self.config.sample_rate / block_size))
+            
+            # Create crossfade between original and delayed signal
+            xfade_width = int(cutoff_bin * 0.5)  # 50% of cutoff for smooth transition
+            
+            # Create transition curve (from 0 to 1)
+            transition = cp.zeros(n_freqs, dtype=self.precision)
+            transition[:cutoff_bin-xfade_width] = 0.0  # Below crossfade: all original
+            transition[cutoff_bin+xfade_width:] = 0.7  # Above crossfade: 70% delayed, 30% original
+            
+            # Smooth crossfade in the transition region
+            if xfade_width > 0:
+                transition[cutoff_bin-xfade_width:cutoff_bin+xfade_width] = cp.linspace(
+                    0.0, 0.7, 2*xfade_width, dtype=self.precision)
+            
+            # Create the hybrid signal
+            hybrid_fft = right_fft * (1.0 - transition) + right_delayed_fft * transition
+            
+            # Convert back to time domain
+            noise_block[1, :block_size] = cufft.irfft(hybrid_fft, n=block_size)
+        
+        return noise_block
+
+    def _apply_micro_pitch_variations(self, noise_block, block_start_idx, block_size):
+        """Apply subtle micro-pitch variations for added naturalness"""
+        # Only apply if natural modulation is enabled
+        if not self.config.natural_modulation:
+            return noise_block
+            
+        # Create extremely slow modulation sources for pitch variations
+        t_start = block_start_idx / self.config.sample_rate
+        
+        # Create different pitch variation rates for different frequency bands
+        # These are extremely slow to avoid obvious wobbling effects
+        low_pitch_mod = 0.005 * cp.sin(2 * cp.pi * 0.011 * t_start)           # ±0.5% variation
+        mid_pitch_mod = 0.003 * cp.sin(2 * cp.pi * 0.019 * t_start + 0.7)     # ±0.3% variation
+        high_pitch_mod = 0.002 * cp.sin(2 * cp.pi * 0.031 * t_start + 1.4)    # ±0.2% variation
+        
+        # Process each channel
+        for ch in range(2):
+            # Convert to frequency domain
+            channel_fft = cufft.rfft(noise_block[ch, :block_size])
+            
+            # Get frequency bin indices
+            n_bins = len(channel_fft)
+            freq_resolution = self.config.sample_rate / block_size
+            low_idx = int(300 / freq_resolution)
+            mid_idx = int(1500 / freq_resolution)
+            
+            # Create arrays to hold the resampled spectrum
+            resampled_fft = cp.zeros_like(channel_fft, dtype=cp.complex128)
+            
+            # Process each frequency band separately with different pitch variations
+            # For low frequencies: apply low_pitch_mod
+            # For this implementation, we'll use a simplified approach using bin shifting
+            
+            # Low frequencies
+            for i in range(1, low_idx):  # Skip DC (bin 0)
+                # Calculate fractional bin shift
+                bin_shift = i * low_pitch_mod  # Proportional to frequency
+                bin_int = int(i + bin_shift)
+                bin_frac = (i + bin_shift) - bin_int
+                
+                # Ensure we stay within valid bin range
+                if 0 <= bin_int < n_bins-1:
+                    # Linear interpolation between bins for fractional shifts
+                    resampled_fft[i] = channel_fft[bin_int] * (1 - bin_frac) + channel_fft[bin_int+1] * bin_frac
+                    
+            # Mid frequencies
+            for i in range(low_idx, mid_idx):
+                bin_shift = i * mid_pitch_mod
+                bin_int = int(i + bin_shift)
+                bin_frac = (i + bin_shift) - bin_int
+                
+                if 0 <= bin_int < n_bins-1:
+                    resampled_fft[i] = channel_fft[bin_int] * (1 - bin_frac) + channel_fft[bin_int+1] * bin_frac
+                    
+            # High frequencies
+            for i in range(mid_idx, n_bins):
+                bin_shift = i * high_pitch_mod
+                bin_int = int(i + bin_shift)
+                bin_frac = (i + bin_shift) - bin_int
+                
+                if 0 <= bin_int < n_bins-1:
+                    resampled_fft[i] = channel_fft[bin_int] * (1 - bin_frac) + channel_fft[bin_int+1] * bin_frac
+            
+            # Preserve DC component
+            resampled_fft[0] = channel_fft[0]
+            
+            # Convert back to time domain
+            noise_block[ch, :block_size] = cufft.irfft(resampled_fft, n=block_size)
+        
+        return noise_block
+        
+    def _apply_lfo_modulation(self, noise_block, block_start_idx, block_size):
+        """Apply LFO modulation if enabled"""
+        if not self.config.lfo_rate:
+            return noise_block
+        
+        # Create LFO modulation envelope
+        block_time = block_size / self.config.sample_rate
+        
+        # Generate time indices for this block
+        t_start = block_start_idx / self.config.sample_rate
+        t = cp.linspace(t_start, t_start + block_time, block_size, endpoint=False)
+        
+        # Create sinusoidal modulation (±1dB)
+        modulation_depth = 10**(1.0/20) - 10**(-1.0/20)  # ±1dB in linear scale
+        modulation = 1.0 + modulation_depth/2 * cp.sin(2 * cp.pi * self.config.lfo_rate * t)
+        
+        # Apply same modulation to both channels
+        noise_block[0, :block_size] = noise_block[0, :block_size] * modulation
+        noise_block[1, :block_size] = noise_block[1, :block_size] * modulation
+        
+        return noise_block
+    
+    def _blend_noise_colors(self, white, pink, brown, color_mix, block_size):
+        """Blend different noise colors on GPU according to color mix"""
+        white_gain = cp.sqrt(color_mix.get('white', 0))
+        pink_gain = cp.sqrt(color_mix.get('pink', 0))
+        brown_gain = cp.sqrt(color_mix.get('brown', 0))
+        
+        # Normalize to ensure consistent levels regardless of mix
+        total_power = white_gain**2 + pink_gain**2 + brown_gain**2
+        normalization = cp.sqrt(1.0 / (total_power + 1e-10))
+        
+        white_gain *= normalization
+        pink_gain *= normalization
+        brown_gain *= normalization
+        
+        # Mix stereo signals (channel-wise)
+        self._mixed_buffer[0, :block_size] = (
+            white[0, :block_size] * white_gain + 
+            pink[0, :block_size] * pink_gain + 
+            brown[0, :block_size] * brown_gain
+        )
+        
+        self._mixed_buffer[1, :block_size] = (
+            white[1, :block_size] * white_gain + 
+            pink[1, :block_size] * pink_gain + 
+            brown[1, :block_size] * brown_gain
+        )
+        
+        return self._mixed_buffer[:, :block_size]
     
     def _apply_gain_and_limiting(self, noise_block, target_rms, peak_ceiling, block_size):
         """Multi-stage gain and limiting for better sound quality using efficient linear calculations"""
@@ -833,57 +1155,6 @@ class NoiseGenerator:
         
         return noise_block
     
-    def _apply_lfo_modulation(self, noise_block, block_start_idx, block_size):
-        """Apply LFO modulation if enabled"""
-        if not self.config.lfo_rate:
-            return noise_block
-        
-        # Create LFO modulation envelope
-        block_time = block_size / self.config.sample_rate
-        
-        # Generate time indices for this block
-        t_start = block_start_idx / self.config.sample_rate
-        t = cp.linspace(t_start, t_start + block_time, block_size, endpoint=False)
-        
-        # Create sinusoidal modulation (±1dB)
-        modulation_depth = 10**(1.0/20) - 10**(-1.0/20)  # ±1dB in linear scale
-        modulation = 1.0 + modulation_depth/2 * cp.sin(2 * cp.pi * self.config.lfo_rate * t)
-        
-        # Apply same modulation to both channels
-        noise_block[0, :block_size] = noise_block[0, :block_size] * modulation
-        noise_block[1, :block_size] = noise_block[1, :block_size] * modulation
-        
-        return noise_block
-    
-    def _blend_noise_colors(self, white, pink, brown, color_mix, block_size):
-        """Blend different noise colors on GPU according to color mix"""
-        white_gain = cp.sqrt(color_mix.get('white', 0))
-        pink_gain = cp.sqrt(color_mix.get('pink', 0))
-        brown_gain = cp.sqrt(color_mix.get('brown', 0))
-        
-        # Normalize to ensure consistent levels regardless of mix
-        total_power = white_gain**2 + pink_gain**2 + brown_gain**2
-        normalization = cp.sqrt(1.0 / (total_power + 1e-10))
-        
-        white_gain *= normalization
-        pink_gain *= normalization
-        brown_gain *= normalization
-        
-        # Mix stereo signals (channel-wise)
-        self._mixed_buffer[0, :block_size] = (
-            white[0, :block_size] * white_gain + 
-            pink[0, :block_size] * pink_gain + 
-            brown[0, :block_size] * brown_gain
-        )
-        
-        self._mixed_buffer[1, :block_size] = (
-            white[1, :block_size] * white_gain + 
-            pink[1, :block_size] * pink_gain + 
-            brown[1, :block_size] * brown_gain
-        )
-        
-        return self._mixed_buffer[:, :block_size]
-    
     def generate_block(self, block_size, block_start_idx=0):
         """Generate a block of noise with the specified configuration"""
         # Generate white noise base
@@ -920,10 +1191,16 @@ class NoiseGenerator:
         # Apply Haas effect for enhanced stereo imaging if enabled
         if self.config.haas_effect:
             mixed_noise = self._apply_haas_effect(mixed_noise, block_size)
+        
+        # NEW! Apply dynamic stereo parameters for evolving stereo field
+        mixed_noise = self._apply_dynamic_stereo_parameters(mixed_noise, block_start_idx, block_size)
             
         # Apply natural modulation for more organic sound if enabled
         if self.config.natural_modulation:
             mixed_noise = self._apply_natural_modulation(mixed_noise, block_start_idx, block_size)
+        
+        # NEW! Apply subtle micro-pitch variations for added naturalness
+        mixed_noise = self._apply_micro_pitch_variations(mixed_noise, block_start_idx, block_size)
         
         # Apply LFO modulation if enabled
         mixed_noise = self._apply_lfo_modulation(mixed_noise, block_start_idx, block_size)
@@ -1369,7 +1646,7 @@ def load_preset(preset_name):
 def main():
     """Main entry point for the headless Baby-Noise Generator"""
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Baby-Noise Generator v2.0.5 - Optimized DSP (Headless)")
+    parser = argparse.ArgumentParser(description="Baby-Noise Generator v2.0.6 - Enhanced Organic DSP (Headless)")
     
     # Key parameters - removed channels parameter, now always stereo
     parser.add_argument("--output", type=str, help="Output file path (WAV or FLAC)", default="baby_noise.wav")
