@@ -618,8 +618,9 @@ class NoiseGenerator:
         self._init_filters()
 
         # Precompute crossfade windows on GPU
-        self._fade_in = cp.linspace(0, 1, BLOCK_OVERLAP, dtype=self.precision)
-        self._fade_out = cp.linspace(1, 0, BLOCK_OVERLAP, dtype=self.precision)
+        t = cp.linspace(0, cp.pi / 2, BLOCK_OVERLAP, dtype=self.precision)
+        self._fade_in = cp.sin(t) ** 2
+        self._fade_out = cp.cos(t) ** 2
 
         # Progress tracking
         self.progress_callback = None
